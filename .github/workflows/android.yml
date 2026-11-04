@@ -1,0 +1,71 @@
+name: Build APK
+
+# 推 tag（v*）时构建 debug APK 并挂到 Release；也可以在 Actions 页手动触发
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0'
+
+      # 本地（ARM 设备 + QEMU）需要把 aapt2 指向 x86_64 的替身，
+      # GitHub runner 本身是 x86_64，用官方 aapt2 即可，这行必须去掉
+      - name: Drop local aapt2 override
+        run: sed -i '/aapt2FromMavenOverride/d' gradle.properties
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Show artifact info
+        run: |
+          ls -l app/build/outputs/apk/debug/
+          sha256sum app/build/outputs/apk/debug/*.apk | tee apk.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: airannounce-debug
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            apk.sha256
+
+      - name: Attach APK to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/build/outputs/apk/debug/*.apk
+            apk.sha256
+          generate_release_notes: true
+          body: |
+            debug 签名包，可直接安装。
+
+            注意：CI 用临时生成的 debug keystore 签名，和本机自建的 debug 包签名不同，
+            覆盖安装会提示签名不一致，需要先卸载旧包。
+
+            校验：见附带的 apk.sha256。
