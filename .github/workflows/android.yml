@@ -55,28 +55,30 @@ jobs:
             apk.sha256
 
       # 把本次构建的结果写进 ci-status 分支：没有 token 的环境（比如本机）也能
-      # 用 git 协议直接看到 CI 成没成功，不必去 Actions 页面翻日志
+      # 用 git 协议直接看到 CI 成没成功，不必去 Actions 页面翻日志。
+      # 注意：Commit 用 commit-tree 构造，不碰工作区；push 复用 checkout 配好的
+      # 凭证（run 步骤里默认没有 GITHUB_TOKEN，写 ${GITHUB_TOKEN} 会挂起等输入）
       - name: Report build status
         if: always()
         env:
           BUILD_STATUS: ${{ job.status }}
         run: |
-          mkdir -p /tmp/ci-status && cd /tmp/ci-status
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
           {
             echo "status=${BUILD_STATUS}"
             echo "sha=${GITHUB_SHA}"
             echo "ref=${GITHUB_REF_NAME}"
             echo "run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo "built_at=$(date -u +%FT%TZ)"
-            if [ -f "$GITHUB_WORKSPACE/apk.sha256" ]; then
-              echo "apk_sha256=$(cut -d' ' -f1 "$GITHUB_WORKSPACE/apk.sha256")"
+            if [ -f apk.sha256 ]; then
+              echo "apk_sha256=$(cut -d' ' -f1 apk.sha256)"
             fi
-          } > ci-status.txt
-          git init -q -b ci-status
-          git add -A
-          git -c user.name=github-actions -c user.email=actions@users.noreply.github.com \
-              commit -q -m "CI ${BUILD_STATUS} ${GITHUB_SHA::7}"
-          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-status
+          } > /tmp/ci-status.txt
+          BLOB=$(git hash-object -w /tmp/ci-status.txt)
+          TREE=$(printf '100644 blob %s\tci-status.txt\n' "$BLOB" | git mktree)
+          COMMIT=$(git commit-tree "$TREE" -m "CI ${BUILD_STATUS} ${GITHUB_SHA::7}")
+          git push -f origin "$COMMIT:refs/heads/ci-status"
 
       - name: Attach APK to release
         if: startsWith(github.ref, 'refs/tags/')
