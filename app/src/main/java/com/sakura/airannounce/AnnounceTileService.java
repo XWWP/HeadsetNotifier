@@ -46,6 +46,7 @@ public class AnnounceTileService extends TileService {
         boolean enabled = !preferences.getBoolean(MainActivity.KEY_ENABLED, true);
         preferences.edit().putBoolean(MainActivity.KEY_ENABLED, enabled).apply();
         Log.i(TAG, "Tile toggled, announcements enabled=" + enabled);
+        NotificationReaderService.recordEvent(enabled ? "磁贴开启播报" : "磁贴关闭播报");
 
         MainActivity.syncKeepAlive(this);
         updateTile();

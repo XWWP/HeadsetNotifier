@@ -79,19 +79,6 @@ public class MainActivity extends Activity {
     private TextView heroStateView;
     private GradientDrawable heroStateChipBg;
     private Switch enabledSwitch;
-    private EditText allowedInput;
-    private Switch boostSwitch;
-    private SeekBar volumeBar;
-    private TextView volumeLabel;
-    private SeekBar rateBar;
-    private TextView rateLabel;
-    private SeekBar pollBar;
-    private TextView pollLabel;
-    private Switch dndSwitch;
-    private SeekBar dndStartBar;
-    private SeekBar dndEndBar;
-    private TextView dndLabel;
-    private LinearLayout dndGroup;
     private AlertDialog auditDialog;
     private ScrollView mainScrollView;
     private TextView shizukuStateLabel;
@@ -1025,8 +1012,8 @@ public class MainActivity extends Activity {
         // ---- 诊断 ----
         body.addView(createSectionTitle("故障诊断"));
         TextView diagDesc = new TextView(this);
-        diagDesc.setText("收不到播报时，先跑一次诊断：会检查权限、蓝牙、白名单、服务状态，"
-                + "并列出最近每条通知为什么被跳过。");
+        diagDesc.setText("收不到播报时先跑诊断：检查权限、蓝牙、白名单和服务状态，"
+                + "并列出每条通知被跳过的原因。");
         diagDesc.setTextSize(12.5f);
         diagDesc.setTextColor(TEXT_SECONDARY);
         diagDesc.setLineSpacing(dp(3), 1.0f);
@@ -1037,8 +1024,8 @@ public class MainActivity extends Activity {
         // ---- 防冻结守护 ----
         body.addView(createSectionTitle("防冻结守护（需 Root，可选）"));
         TextView guardText = new TextView(this);
-        guardText.setText("部分厂商 ROM（如一加/ColorOS）会周期性把进程放进 cgroup freezer 冻结，"
-                + "冻结期间代码完全不执行，应用无法自救，需要外部脚本解冻。");
+        guardText.setText("部分 ROM（如一加/ColorOS）会周期性冻结进程，冻结期间应用无法自救，"
+                + "需外部脚本定时解冻。");
         guardText.setTextSize(12.5f);
         guardText.setTextColor(TEXT_SECONDARY);
         guardText.setLineSpacing(dp(3), 1.0f);
@@ -1059,8 +1046,7 @@ public class MainActivity extends Activity {
         body.addView(pathText, pathParams);
 
         TextView guardHint = new TextView(this);
-        guardHint.setText("没有 Root 也能用，只是系统可能在后台冻结应用，造成偶发不播报；"
-                + "此时建议在系统设置里允许自启动、关闭电池优化。");
+        guardHint.setText("没有 Root 也能用，偶发不播报时请在系统设置里允许自启动、关闭电池优化。");
         guardHint.setTextSize(12);
         guardHint.setTextColor(TEXT_TERTIARY);
         guardHint.setLineSpacing(dp(3), 1.0f);
@@ -1081,9 +1067,8 @@ public class MainActivity extends Activity {
         // ---- Shizuku 通道（无 Root 时的降级方案）----
         body.addView(createSectionTitle("Shizuku 通道（可选，无 Root 时用）"));
         TextView shizukuDesc = new TextView(this);
-        shizukuDesc.setText("用 Shizuku 的 shell 权限补三件事：重绑通知监听、把 standby bucket 拉成 active、"
-                + "加入电池优化白名单。它无法解冻被 ColorOS 放进 freezer 的进程，所以效果弱于上面的 root 脚本，"
-                + "只建议在没有 root 的设备上当作兜底。");
+        shizukuDesc.setText("借 Shizuku 的 shell 权限补做三件事：重绑监听、standby 拉 active、"
+                + "加入电池白名单。无法解冻被冻结的进程，仅作无 Root 设备的兜底。");
         shizukuDesc.setTextSize(12.5f);
         shizukuDesc.setTextColor(TEXT_SECONDARY);
         shizukuDesc.setLineSpacing(dp(3), 1.0f);
@@ -1099,8 +1084,7 @@ public class MainActivity extends Activity {
         LinearLayout shizukuButtons = new LinearLayout(this);
         shizukuButtons.setOrientation(LinearLayout.HORIZONTAL);
 
-        Button shizukuGrant = createOutlineButton("授权 Shizuku", () -> {
-        });
+        Button shizukuGrant = createOutlineButton("授权 Shizuku", null);
         shizukuGrant.setOnClickListener(v -> {
             // NOT_RUNNING 时这个按钮是「打开 Shizuku」，激活后再回来授权
             if (ShizukuChannel.State.NOT_RUNNING.equals(v.getTag())) {
@@ -1117,8 +1101,7 @@ public class MainActivity extends Activity {
         grantParams.rightMargin = dp(10);
         shizukuButtons.addView(shizukuGrant, grantParams);
 
-        Button shizukuApply = createOutlineButton("立即应用", () -> {
-        });
+        Button shizukuApply = createOutlineButton("立即应用", null);
         shizukuApply.setOnClickListener(v -> {
             v.setEnabled(false);
             shizukuState.setText("正在通过 Shizuku 应用…");
@@ -1299,7 +1282,10 @@ public class MainActivity extends Activity {
         btn.setBackground(bg);
         btn.setStateListAnimator(null);
         btn.setPadding(dp(14), dp(12), dp(14), dp(12));
-        btn.setOnClickListener(v -> onClick.run());
+        // onClick 传 null 表示稍后自行 setOnClickListener（需要拿到按钮自身时用）
+        if (onClick != null) {
+            btn.setOnClickListener(v -> onClick.run());
+        }
         return btn;
     }
 
@@ -1352,6 +1338,9 @@ public class MainActivity extends Activity {
 
         boolean serviceRunning = NotificationReaderService.isServiceRunning();
         report.append(serviceRunning ? "✓ 监听服务：运行中\n" : "✗ 监听服务：未运行（尝试重新打开应用）\n");
+
+        report.append("\n【运行时状态】\n");
+        report.append(NotificationReaderService.describeRuntime()).append("\n");
 
         report.append("\n【进程存活情况】\n");
         String interruptions = NotificationReaderService.getInterruptionLog(this);

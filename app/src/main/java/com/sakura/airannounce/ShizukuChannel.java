@@ -131,8 +131,10 @@ public final class ShizukuChannel {
      * 内部有 Binder 调用，必须在后台线程调用。
      */
     static String apply(Context context) {
-        if (state(context) != State.READY) {
-            return "Shizuku 当前不可用：" + describe(state(context));
+        // state() 内部有 binder 调用，结果先用局部变量存住，别查两次
+        State currentState = state(context);
+        if (currentState != State.READY) {
+            return "Shizuku 当前不可用：" + describe(currentState);
         }
         IShizukuService service;
         try {

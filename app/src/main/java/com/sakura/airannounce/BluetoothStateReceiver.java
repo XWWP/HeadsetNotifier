@@ -109,10 +109,15 @@ public class BluetoothStateReceiver extends BroadcastReceiver {
                 .getBoolean(MainActivity.KEY_ENABLED, true);
         if (!enabled) {
             Log.i(TAG, "Announcements disabled; skipping keep-alive.");
+            NotificationReaderService.recordEvent("蓝牙耳机已连接，但播报已关闭，未启保活");
             return;
         }
+        boolean wasRunning = KeepAliveService.isRunning();
         KeepAliveService.start(context);
         NotificationReaderService.requestRebindIfNeeded(context);
+        if (!wasRunning) {
+            NotificationReaderService.recordEvent("蓝牙耳机已连接");
+        }
     }
 
     /**
@@ -121,7 +126,11 @@ public class BluetoothStateReceiver extends BroadcastReceiver {
     private void handlePossibleDisconnect(Context context) {
         if (!MainActivity.hasBluetoothAudioOutput(context)) {
             Log.i(TAG, "No Bluetooth audio output left; stopping keep-alive.");
+            boolean wasRunning = KeepAliveService.isRunning();
             KeepAliveService.stop(context);
+            if (wasRunning) {
+                NotificationReaderService.recordEvent("蓝牙音频已断开，保活停止");
+            }
         }
     }
 }

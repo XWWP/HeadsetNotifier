@@ -8,9 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
-import android.os.Handler;
 import android.os.IBinder;
-import android.os.Looper;
 import android.util.Log;
 
 /**
@@ -26,6 +24,10 @@ public class KeepAliveService extends Service {
     private static final int NOTIFICATION_ID = 1001;
 
     private static volatile boolean running;
+
+    static boolean isRunning() {
+        return running;
+    }
 
     static void start(Context context) {
         if (running) {
@@ -89,8 +91,10 @@ public class KeepAliveService extends Service {
                 startForeground(NOTIFICATION_ID, notification);
             }
             Log.i(TAG, "KeepAliveService is now foreground.");
+            NotificationReaderService.recordEvent("保活服务已启动");
         } catch (RuntimeException exception) {
             Log.e(TAG, "startForeground failed", exception);
+            NotificationReaderService.recordEvent("保活服务启动失败：" + exception.getClass().getSimpleName());
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -107,6 +111,7 @@ public class KeepAliveService extends Service {
         } catch (RuntimeException ignored) {
         }
         Log.i(TAG, "KeepAliveService destroyed.");
+        NotificationReaderService.recordEvent("保活服务已停止");
         try {
             stopForeground(STOP_FOREGROUND_REMOVE);
         } catch (RuntimeException exception) {

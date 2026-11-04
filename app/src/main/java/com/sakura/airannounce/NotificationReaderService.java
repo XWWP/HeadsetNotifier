@@ -91,10 +91,9 @@ public class NotificationReaderService extends NotificationListenerService {
     private boolean ttsReady;
     private int ttsInitRetries;
     private static final int MAX_TTS_INIT_RETRIES = 3;
-    private int queuedUtterances;
     private int savedMusicVolume = -1;
     /** 正在播报中的 utteranceId。用集合而非计数，避免 TTS 同时回调 onDone/onStop 把计数减成负数。 */
-    private final java.util.Set<String> activeUtterances = new java.util.HashSet<>();
+    private final Set<String> activeUtterances = new HashSet<>();
     /** 音量提升后的兜底恢复：无论回调是否到达，超时一定恢复原音量。 */
     /** 超时守卫：固定引用才能 removeCallbacks。 */
     private final Runnable utteranceTimeoutGuard = this::onUtteranceTimeoutGuard;
@@ -112,12 +111,13 @@ public class NotificationReaderService extends NotificationListenerService {
     /** 最近处理记录：让用户（含未 root）能自己在应用里看到每条通知为什么没播。 */
     private static final java.util.LinkedList<String> RECENT_EVENTS = new java.util.LinkedList<>();
     private static final int MAX_RECENT_EVENTS = 60;
+    /** 非线程安全，所有使用点都在 RECENT_EVENTS 锁内。 */
+    private static final java.text.SimpleDateFormat EVENT_STAMP =
+            new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault());
 
     static void recordEvent(String event) {
-        String stamp = new java.text.SimpleDateFormat("HH:mm:ss",
-                java.util.Locale.getDefault()).format(new java.util.Date());
         synchronized (RECENT_EVENTS) {
-            RECENT_EVENTS.addFirst(stamp + "  " + event);
+            RECENT_EVENTS.addFirst(EVENT_STAMP.format(new java.util.Date()) + "  " + event);
             while (RECENT_EVENTS.size() > MAX_RECENT_EVENTS) {
                 RECENT_EVENTS.removeLast();
             }
@@ -253,6 +253,30 @@ public class NotificationReaderService extends NotificationListenerService {
                 .getString(PREF_INTERRUPTION_LOG, "");
     }
 
+    /**
+     * 诊断用：把关键运行时状态拼成几行文本。
+     * 用户看不到 logcat，排查「为什么不播」只能靠这些状态 + 最近处理记录。
+     */
+    static String describeRuntime() {
+        NotificationReaderService service = instance;
+        if (service == null) {
+            return "· 监听服务：未运行";
+        }
+        long sinceCallback = service.lastCallbackMs <= 0
+                ? -1L
+                : SystemClock.elapsedRealtime() - service.lastCallbackMs;
+        StringBuilder builder = new StringBuilder();
+        builder.append("· TTS：").append(service.ttsReady ? "就绪" : "未就绪").append('\n');
+        builder.append("· 待播队列：").append(service.pendingAnnouncements.size())
+                .append(" 条，播放中：").append(service.activeUtterances.size()).append(" 条\n");
+        builder.append("· 轮询间隔：").append(service.pollInterval() / 1000f).append(" 秒\n");
+        builder.append("· 最近系统回调：")
+                .append(sinceCallback < 0 ? "尚未收到" : (sinceCallback / 1000L) + " 秒前")
+                .append('\n');
+        builder.append("· 保活服务：").append(KeepAliveService.isRunning() ? "运行中" : "未运行");
+        return builder.toString();
+    }
+
     static void clearInterruptionLog(Context context) {
         context.getSharedPreferences(MainActivity.PREFERENCES_NAME, Context.MODE_PRIVATE)
                 .edit()
@@ -277,7 +301,6 @@ public class NotificationReaderService extends NotificationListenerService {
                 recordEvent("蓝牙音频已断开（队列已清空）");
                 pendingAnnouncements.clear();
                 activeUtterances.clear();
-                queuedUtterances = 0;
                 if (textToSpeech != null) {
                     textToSpeech.stop();
                 }
@@ -306,6 +329,7 @@ public class NotificationReaderService extends NotificationListenerService {
         Log.i(TAG, "Service onCreate.");
         instance = this;
         detectInterruption();
+        recordEvent("监听服务已启动");
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         if (audioManager != null) {
             audioManager.registerAudioDeviceCallback(audioDeviceCallback, mainHandler);
@@ -322,6 +346,7 @@ public class NotificationReaderService extends NotificationListenerService {
     public void onListenerConnected() {
         super.onListenerConnected();
         Log.i(TAG, "onListenerConnected: listener is bound and ready.");
+        recordEvent("监听已连接");
         ensureKeepAliveIfNeeded();
         // 重新绑定后恢复轮询，避免被系统解绑再绑定时轮询已停。
         pollHandler.removeCallbacks(pollRunnable);
@@ -332,6 +357,7 @@ public class NotificationReaderService extends NotificationListenerService {
     public void onListenerDisconnected() {
         super.onListenerDisconnected();
         Log.w(TAG, "onListenerDisconnected: rebinding.");
+        recordEvent("监听已断开，2 秒后尝试重绑");
         // 系统解绑后（后台限制、进程降级等），主动请求重新绑定。
         if (!destroyed) {
             mainHandler.postDelayed(() -> {
@@ -520,6 +546,7 @@ public class NotificationReaderService extends NotificationListenerService {
             }
             pollInitialized = true;
             Log.i(TAG, "Polling baseline: " + active.length + " notifications.");
+            recordEvent("轮询基线建立：" + active.length + " 条已有通知不播报");
             return;
         }
         // 只处理"新出现"或"内容有更新"的通知。
@@ -650,21 +677,31 @@ public class NotificationReaderService extends NotificationListenerService {
 
     /**
      * 白名单制：列表为空时播报所有应用；填入包名后只播报这些应用。
+     * 解析结果按原文缓存：轮询每秒级触发，每条通知都 split+建 Set 是无谓开销。
+     * 统一用 Locale.ROOT 做小写归一，避免土耳其语区 I→ı 的匹配异常。
      */
+    private String cachedAllowRaw;
+    private Set<String> cachedAllowSet;
+
     private boolean isPackageAllowed(String packageName) {
         String allowed = getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE)
                 .getString(MainActivity.KEY_ALLOWED_PACKAGES, "");
-        if (allowed == null || allowed.trim().isEmpty()) {
+        String raw = allowed == null ? "" : allowed.trim();
+        if (raw.isEmpty()) {
             return true;
         }
-        Set<String> allowedSet = new HashSet<>();
-        for (String entry : allowed.split(",")) {
-            String trimmed = entry.trim();
-            if (!trimmed.isEmpty()) {
-                allowedSet.add(trimmed.toLowerCase());
+        if (!raw.equals(cachedAllowRaw)) {
+            Set<String> parsed = new HashSet<>();
+            for (String entry : raw.split(",")) {
+                String trimmed = entry.trim();
+                if (!trimmed.isEmpty()) {
+                    parsed.add(trimmed.toLowerCase(java.util.Locale.ROOT));
+                }
             }
+            cachedAllowRaw = raw;
+            cachedAllowSet = parsed;
         }
-        return allowedSet.contains(packageName.toLowerCase());
+        return cachedAllowSet.contains(packageName.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -740,6 +777,7 @@ public class NotificationReaderService extends NotificationListenerService {
     @Override
     public void onDestroy() {
         Log.i(TAG, "Service onDestroy.");
+        recordEvent("监听服务已销毁");
         destroyed = true;
         pollHandler.removeCallbacksAndMessages(null);
         mainHandler.removeCallbacksAndMessages(null);
@@ -906,7 +944,6 @@ public class NotificationReaderService extends NotificationListenerService {
             }
             service.pendingAnnouncements.clear();
             service.activeUtterances.clear();
-            service.queuedUtterances = 0;
             if (service.textToSpeech != null) {
                 service.textToSpeech.stop();
             }
@@ -927,7 +964,9 @@ public class NotificationReaderService extends NotificationListenerService {
             pendingAnnouncements.clear();
             return;
         }
-        if (!MainActivity.hasBluetoothAudioOutput(this)) {
+        // 用 1 秒缓存的蓝牙状态即可：hasBluetoothAudioOutput 每次都跨 binder 查
+        // AudioManager，而这里的判定不依赖亚秒级精度。
+        if (!isBluetoothConnected()) {
             Log.i(TAG, "drain: no bluetooth audio output, dropping queue.");
             pendingAnnouncements.clear();
             return;
@@ -979,7 +1018,6 @@ public class NotificationReaderService extends NotificationListenerService {
         String utteranceId = UUID.randomUUID().toString();
         // 先登记再 speak：极短的语音可能在回调前就结束，顺序反过来会漏记
         activeUtterances.add(utteranceId);
-        queuedUtterances = activeUtterances.size();
         int result = textToSpeech.speak(
                 announcement, TextToSpeech.QUEUE_ADD, new Bundle(), utteranceId);
         Log.i(TAG, "speak result=" + result + " text=" + announcement);
@@ -987,7 +1025,6 @@ public class NotificationReaderService extends NotificationListenerService {
         if (result == TextToSpeech.ERROR) {
             Log.e(TAG, "speak: TTS rejected the utterance.");
             activeUtterances.remove(utteranceId);
-            queuedUtterances = activeUtterances.size();
             if (activeUtterances.isEmpty()) {
                 abandonAudioFocus();
                 restoreVolumeAfterSpeech();
@@ -1042,8 +1079,7 @@ public class NotificationReaderService extends NotificationListenerService {
             Log.i(TAG, "duplicate TTS finish callback " + utteranceId + ", ignored.");
             return;
         }
-        queuedUtterances = activeUtterances.size();
-        if (queuedUtterances == 0) {
+        if (activeUtterances.isEmpty()) {
             // 不撤的话，上一批残留的守卫会在下一批刚 speak、还没 onStart 的
             // 空隙里误触发，把新批次连焦点带音量一起清掉
             mainHandler.removeCallbacks(utteranceTimeoutGuard);
@@ -1072,7 +1108,6 @@ public class NotificationReaderService extends NotificationListenerService {
             recordEvent("焦点被短暂抢占，已暂停，稍后继续");
         }
         activeUtterances.clear();
-        queuedUtterances = 0;
         if (textToSpeech != null) {
             textToSpeech.stop();
         }

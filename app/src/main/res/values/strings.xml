@@ -3,22 +3,8 @@
     <string name="service_name">耳机通知播报</string>
     <string name="title">耳机通知播报</string>
     <string name="description">连接蓝牙音频设备时，朗读新通知的内容。</string>
-    <string name="notification_access">通知读取权限</string>
-    <string name="open_notification_settings">打开通知访问设置</string>
     <string name="enable_announcements">启用通知播报</string>
     <string name="test_voice">测试语音</string>
-    <string name="status_title">当前状态</string>
-    <string name="state_access_granted">通知读取权限：已授权</string>
-    <string name="state_access_missing">通知读取权限：未授权</string>
-    <string name="state_enabled">通知播报：已启用</string>
-    <string name="state_disabled">通知播报：已暂停</string>
-    <string name="state_bluetooth_connected">蓝牙音频：已连接</string>
-    <string name="state_bluetooth_disconnected">蓝牙音频：未连接</string>
-    <string name="state_battery_ok">电池优化：已豁免</string>
-    <string name="state_battery_missing">电池优化：未豁免（可能影响后台）</string>
-    <string name="state_whitelist_empty">白名单：空（播报所有应用）</string>
-    <string name="state_whitelist_count">白名单：%1$d 个应用</string>
-    <string name="access_required">请先在系统设置中授予通知读取权限。</string>
     <string name="test_message">这是一条语音播报测试，验证码 846291。</string>
     <string name="tts_init_failed">系统文字转语音初始化失败，请检查系统 TTS 引擎。</string>
     <string name="tts_not_ready">语音引擎仍在启动，请稍后再试。</string>
@@ -38,7 +24,6 @@
     <string name="speech_rate_label">语速：%1$d%%</string>
     <string name="volume_label">音量：%1$d%%（播报时的目标媒体音量）</string>
     <string name="boost_volume_title">播报时自动提高媒体音量</string>
-    <string name="boost_volume_desc">仅在当前音量低于设定值时临时提高，播报结束后恢复原音量。</string>
     <string name="beep_before_speech">播报前播放提示音</string>
 
     <string name="allowed_packages_desc">只播报列表内的应用。留空则播报所有应用（除本应用外）。</string>
@@ -52,12 +37,8 @@
 
     <string name="poll_interval_label">后台轮询间隔：%1$.1f 秒（越小越及时，越大越省电）</string>
 
-    <string name="section_system">系统集成声明</string>
-    <string name="system_script_desc">本应用可能配合一个外部系统脚本运行，用于防止系统冻结本应用进程而导致播报中断。\n\n脚本路径：\n/data/adb/service.d/airannounce-thaw.sh\n\n作用：检查本应用是否被系统冻结，若被冻结则解除。仅在连接蓝牙耳机、应用需要工作时高频执行；未连接耳机时自动降频，几乎不产生开销。\n\n该脚本是可选的。未安装（或设备没有 root）时，应用基本功能不受影响，但系统可能在后台冻结应用，造成偶发不播报。\n\n如需卸载：删除上述文件后重启设备即可。</string>
     <string name="copy_uninstall_command">复制卸载命令</string>
     <string name="copied_to_clipboard">已复制到剪贴板</string>
-    <string name="system_script_installed">系统脚本：已检测到</string>
-    <string name="system_script_missing">系统脚本：未检测到</string>
 
     <string name="permission_audit_button">检查权限</string>
 
