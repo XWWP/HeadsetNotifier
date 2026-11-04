@@ -26,7 +26,17 @@ public class BluetoothStateReceiver extends BroadcastReceiver {
         if (intent == null || intent.getAction() == null) {
             return;
         }
+        // Android 12+ 用户拒绝 BLUETOOTH_CONNECT 时，读取 EXTRA_DEVICE / getAddress /
+        // getBluetoothClass 会抛 SecurityException；部分 ROM 授权后也会偶发。
+        // 广播接收器里异常不兜底就是一次崩溃弹窗，这里只记录不抛出。
+        try {
+            handleAction(context, intent);
+        } catch (Throwable throwable) {
+            Log.w(TAG, "Bluetooth broadcast handling failed: " + intent.getAction(), throwable);
+        }
+    }
 
+    private void handleAction(Context context, Intent intent) {
         String action = intent.getAction();
         switch (action) {
             case BluetoothDevice.ACTION_ACL_CONNECTED: {

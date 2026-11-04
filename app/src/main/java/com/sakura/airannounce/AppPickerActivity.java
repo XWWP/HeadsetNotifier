@@ -18,6 +18,7 @@ import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
@@ -135,15 +136,22 @@ public class AppPickerActivity extends Activity {
             updateCount();
             adapter.notifyDataSetChanged();
         });
-        root.addView(listView, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-
         emptyView = new TextView(this);
         emptyView.setText(R.string.picker_loading);
         emptyView.setTextSize(15);
         emptyView.setTextColor(0xFF6B6B6B);
         emptyView.setGravity(Gravity.CENTER);
         emptyView.setPadding(0, dp(40), 0, 0);
+
+        // emptyView 必须和列表同层叠加：原来加在底部按钮栏之后，
+        // 被 weight=1 的列表挤到屏幕外，加载/空态提示永远看不见。
+        FrameLayout listContainer = new FrameLayout(this);
+        listContainer.addView(listView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        listContainer.addView(emptyView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        root.addView(listContainer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         Button saveButton = createPickerButton(getString(R.string.picker_save), true);
         saveButton.setOnClickListener(view -> {
@@ -198,7 +206,6 @@ public class AppPickerActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         root.addView(bottom, matchWrap());
-        root.addView(emptyView, matchWrap());
 
         setContentView(root);
         updateCount();

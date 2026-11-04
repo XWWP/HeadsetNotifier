@@ -206,20 +206,37 @@ public final class ShizukuChannel {
                 report.append("\u2717 ").append(command).append("（无返回进程）\n");
                 return false;
             }
-            // 先读输出再 waitFor：命令输出填满管道会把子进程卡住
-            String out = read(process.getInputStream());
-            String err = read(process.getErrorStream());
+            // 两个流必须并行排空：顺序读时若 stderr 先填满管道，子进程会卡在
+            // 写 stderr 上，而我们在等 stdout 读完，waitFor 就永远挂起。
+            final String[] out = {""};
+            final String[] err = {""};
+            Thread outThread = new Thread(() -> {
+                try {
+                    out[0] = read(process.getInputStream());
+                } catch (Throwable ignored) {
+                }
+            }, "shizuku-out");
+            Thread errThread = new Thread(() -> {
+                try {
+                    err[0] = read(process.getErrorStream());
+                } catch (Throwable ignored) {
+                }
+            }, "shizuku-err");
+            outThread.start();
+            errThread.start();
             int exitCode = process.waitFor();
+            outThread.join(3000L);
+            errThread.join(3000L);
             boolean ok = exitCode == 0;
             report.append(ok ? "\u2713 " : "\u2717 ").append(command);
             if (!ok) {
                 report.append("（退出码 ").append(exitCode);
-                if (!err.isEmpty()) {
-                    report.append("：").append(err);
+                if (!err[0].isEmpty()) {
+                    report.append("：").append(err[0]);
                 }
                 report.append("）");
-            } else if (!out.isEmpty() && !out.equalsIgnoreCase("success")) {
-                report.append("：").append(out);
+            } else if (!out[0].isEmpty() && !out[0].equalsIgnoreCase("success")) {
+                report.append("：").append(out[0]);
             }
             report.append('\n');
             return ok;
@@ -240,9 +257,10 @@ public final class ShizukuChannel {
             byte[] buffer = new byte[512];
             int length;
             while ((length = input.read(buffer)) > 0) {
-                builder.append(new String(buffer, 0, length));
-                if (builder.length() > 2000) {
-                    break;
+                // 超上限继续读但丢弃：break 会留下未排空的管道，
+                // 子进程写满缓冲区后卡死，waitFor 跟着永远挂起。
+                if (builder.length() <= 2000) {
+                    builder.append(new String(buffer, 0, length));
                 }
             }
         } catch (Throwable throwable) {

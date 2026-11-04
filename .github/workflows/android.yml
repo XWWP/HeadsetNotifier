@@ -33,11 +33,6 @@ jobs:
         with:
           packages: 'platforms;android-35 build-tools;35.0.0'
 
-      # 本地（ARM 设备 + QEMU）需要把 aapt2 指向 x86_64 的替身，
-      # GitHub runner 本身是 x86_64，用官方 aapt2 即可，这行必须去掉
-      - name: Drop local aapt2 override
-        run: sed -i '/aapt2FromMavenOverride/d' gradle.properties
-
       - name: Build debug APK
         run: gradle :app:assembleDebug --no-daemon --stacktrace
 
