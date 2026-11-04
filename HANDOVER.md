@@ -88,6 +88,9 @@ git show origin/ci-status:ci-status.txt
 | `TextFormatter.java` | 播报文本清洗、验证码逐位展开 |
 | `KeepAliveService.java` | 前台保活服务（仅连接耳机时存在） |
 | `AnnounceTileService.java` / `BluetoothStateReceiver.java` / `BootReceiver.java` | 快捷磁贴、蓝牙广播、开机 |
+| `keepalive/` | root 保活模块（Magisk / KernelSU / APatch），独立打包，不参与 APK 构建 |
+
+打 tag 时 CI 会额外把 `keepalive/` 打成 `airannounce-thaw-<version>.zip` 挂到 Release；模块日志在模块目录 `keepalive.log`。
 
 弹窗统一走 `showMiuixDialog(...)` + `createDialogButton(...)`；样式常量在 `res/values/styles.xml`（窗口透明 + 面板自绘 28dp 圆角，不要改回 windowBackground 画圆角，那会被内层直角白底盖住）。
 

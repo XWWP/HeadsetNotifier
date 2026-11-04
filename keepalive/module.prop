@@ -1,0 +1,6 @@
+id=airannounce-thaw
+name=耳机通知播报 防冻结守护
+version=v1.2
+versionCode=3
+author=Eta
+description=给 root 用户的保活：防止 ColorOS/一加周期性冻结「耳机通知播报」进程导致播报中断。有耳机时每 2 秒解冻一次，平时低频待机；只对本应用生效，可随时在管理器里禁用。

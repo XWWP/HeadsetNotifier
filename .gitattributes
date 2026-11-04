@@ -1,0 +1,4 @@
+# 模块脚本要在设备上按 LF 执行，Windows 换行会把 shebang 弄坏
+*.sh text eol=lf
+keepalive/module.prop text eol=lf
+keepalive/META-INF/** text eol=lf

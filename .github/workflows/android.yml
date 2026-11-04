@@ -41,6 +41,15 @@ jobs:
           ls -l app/build/outputs/apk/debug/
           sha256sum app/build/outputs/apk/debug/*.apk | tee apk.sha256
 
+      # root 保活模块：保持 module.prop 在 zip 根目录，管理器才能识别
+      - name: Package keep-alive module
+        run: |
+          VERSION=$(sed -n 's/^version=//p' keepalive/module.prop)
+          cd keepalive
+          zip -qr "../airannounce-thaw-${VERSION}.zip" .
+          cd ..
+          ls -l airannounce-thaw-*.zip
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -48,6 +57,7 @@ jobs:
           path: |
             app/build/outputs/apk/debug/*.apk
             apk.sha256
+            airannounce-thaw-*.zip
 
       # 把本次构建的结果写进 ci-status 分支：没有 token 的环境（比如本机）也能
       # 用 git 协议直接看到 CI 成没成功，不必去 Actions 页面翻日志。
@@ -82,9 +92,12 @@ jobs:
           files: |
             app/build/outputs/apk/debug/*.apk
             apk.sha256
+            airannounce-thaw-*.zip
           generate_release_notes: true
           body: |
             debug 签名包，可直接安装。
+
+            另附 root 保活模块 `airannounce-thaw-*.zip`（Magisk / KernelSU / APatch，可选）。
 
             注意：CI 用临时生成的 debug keystore 签名，和本机自建的 debug 包签名不同，
             覆盖安装会提示签名不一致，需要先卸载旧包。
