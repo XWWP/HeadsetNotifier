@@ -1,0 +1,30 @@
+<resources>
+    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#3482FF</item>
+        <item name="android:colorPrimary">#3482FF</item>
+        <item name="android:colorPrimaryDark">#2A6CD8</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:statusBarColor">#F2F3F5</item>
+        <item name="android:navigationBarColor">#F2F3F5</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowBackground">#F2F3F5</item>
+    </style>
+
+    <!-- MIUIX 弹窗：窗口本身全透明，白色 28dp 圆角由代码里的内容面板绘制。
+         旧实现（inset + 26dp windowBackground）会被内层直角白底盖住，实际只能看到
+         12dp 左右的圆角，这就是「棱角太锐利」的根因。 -->
+    <style name="MiuixDialogTheme" parent="android:style/Theme.Material.Light.Dialog.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsFloating">true</item>
+        <item name="android:backgroundDimAmount">0.42</item>
+        <item name="android:colorAccent">#3482FF</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowMinWidthMajor">90%</item>
+        <item name="android:windowMinWidthMinor">90%</item>
+    </style>
+
+    <!-- 兼容旧名字：代码里仍引用 RoundedDialogTheme 的地方统一走上面的新样式 -->
+    <style name="RoundedDialogTheme" parent="@style/MiuixDialogTheme" />
+</resources>

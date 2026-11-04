@@ -1,0 +1,16 @@
+# Gradle / 构建产物
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+
+# 本机环境
+local.properties
+.DS_Store
+*.iml
+
+# 临时/备份文件
+*.bak
+*.orig
+*.rej
