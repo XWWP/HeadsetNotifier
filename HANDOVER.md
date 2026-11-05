@@ -128,6 +128,7 @@ git show origin/ci-status:ci-status.txt
 | --- | --- |
 | `docs/POWER-REVIEW.md` | 功耗与检测策略评审（对象：2.7.4 + keepalive v1.2，commit `79bc560`） |
 | `docs/POWER-REVIEW-RESPONSE.md` | 上述评审的处置记录（2.7.5）：逐条采纳/不采纳、理由、尚待真机验证项 |
+| `scripts/measure.sh` | 冻结采样脚本：一次跑完输出样本数、实际 vs 设定间隔、frozen=1 占比与模式切换次数，替代人工扒日志手算 |
 
 接手时如果要做功耗相关改动，**先读处置记录**，里面写清了哪些提案已经被否掉、为什么否，避免重复讨论。
 
@@ -139,3 +140,32 @@ git show origin/ci-status:ci-status.txt
 - **`MODE=high` 的退出条件**：前台服务连续 3 次复查失败、或播报开关关闭，模块只把自身置 `low` 并记 `STALE_BLOCK`，等 app 下次拉起刷新 mtime 自动恢复。
 
 改这块最容易出的问题是"以为在保护、其实没有"，所以任何改动都要在真机上 `tail -f keepalive.log` 看一遍节奏。
+
+## 手动重启守护必须进 init 命名空间（踩过坑）
+
+很多工具类 App 的 root shell 跑在**隔离的挂载命名空间**里：`ls /data/data` 只能看到它自己和 GMS 两个条目（本机实测），看不到其他应用的私有目录。后果非常隐蔽：
+
+- 守护脚本照常启动、照常每 20 秒循环、日志正常滚动；
+- 但 `[ -f "$FLAG" ]` 恒为假（`$FLAG` 在 `/data/data/com.sakura.airannounce/files/` 下），于是**永远停在 `low` 模式、永远不进 `high`**；
+- 日志里没有任何报错，只有一行行"模式=low"。这和"耳机没连好""bt_audio_active 坏了"长得一模一样。
+
+2026-11-06 排查"耳机明明连着却长期 low、累计解冻恒为 0"时，真因就是这个，与 `bt_audio_active` 无关（`dumpsys media.audio_policy` 走 binder，不受挂载命名空间影响，一直判得很准）。
+
+验证与正确启动方式：
+
+```sh
+# 1) 确认自己是不是在隔离命名空间：和 init 的 mnt ns 对比
+readlink /proc/1/ns/mnt      # init，例如 mnt:[4026531841]
+readlink /proc/self/ns/mnt   # 若不同，你就在隔离空间里
+
+# 2) 通过 init 的根看真实文件（隔离空间里最可靠的取证方式）
+ls -la /proc/1/root/data/data/com.sakura.airannounce/files/
+
+# 3) 手动重启守护：必须用 nsenter 切进 init 命名空间
+nsenter -t 1 -m sh /data/adb/modules/airannounce-thaw/service.sh
+
+# 4) 装完确认新实例落在正确的命名空间里
+readlink /proc/$(cat /data/adb/modules/airannounce-thaw/keepalive.pid)/ns/mnt
+```
+
+开机时由 KernelSU/Magisk 执行模块 `service.sh`，默认就在正常命名空间，不受影响——**只有手动重启才会踩这个坑**。脚本已内置自检：启动时若看不到 `$DATA` 会记一条明确告警，不要忽略它。

@@ -49,6 +49,13 @@ echo $$ >"$PIDFILE"
 VER=$(grep -m1 '^version=' "$MODDIR/module.prop" 2>/dev/null | cut -d= -f2)
 log "守护启动 pid=$$ 版本=${VER:-未知}"
 
+# 有些 root shell（例如某些工具 App 的终端）跑在隔离的挂载命名空间里，
+# 看不到其他应用的私有目录。在这种环境里启动本脚本，$FLAG 永远不存在，
+# 于是永远停在低频模式、日志也不报错——"守护在跑但从不保护"，最难排查的那种。
+if [ ! -d "$DATA" ]; then
+    log "警告：看不到 $DATA，本实例很可能在隔离挂载命名空间里，将无法进入高频模式。请在开机时由模块自行启动，或用 nsenter -t 1 -m 启动"
+fi
+
 # late_start 阶段执行，等系统服务就绪再开始
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
     sleep 5
