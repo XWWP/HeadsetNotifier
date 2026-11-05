@@ -129,6 +129,7 @@ git show origin/ci-status:ci-status.txt
 | `docs/POWER-REVIEW.md` | 功耗与检测策略评审（对象：2.7.4 + keepalive v1.2，commit `79bc560`） |
 | `docs/POWER-REVIEW-RESPONSE.md` | 上述评审的处置记录（2.7.5）：逐条采纳/不采纳、理由、尚待真机验证项 |
 | `scripts/measure.sh` | 冻结采样脚本：一次跑完输出样本数、实际 vs 设定间隔、frozen=1 占比与模式切换次数，替代人工扒日志手算 |
+| `docs/MEASUREMENT-INTERVAL.md` | 5 秒 vs 20 秒、亮屏 vs 息屏四组对照（40 分钟 / 1100+ 样本，全部 0 次冻结），含方法学更正与局限 |
 
 接手时如果要做功耗相关改动，**先读处置记录**，里面写清了哪些提案已经被否掉、为什么否，避免重复讨论。
 
