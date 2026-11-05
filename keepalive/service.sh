@@ -89,18 +89,27 @@ announce_enabled() {
 }
 
 # 与 app 内 AudioManager.getDevices(GET_DEVICES_OUTPUTS) 的判断对齐：
-# 已连接的蓝牙音频输出会出现在音频策略的可用输出设备里
+# 已连接的蓝牙音频输出会出现在音频策略的「可用输出设备」段里。
+#
+# 必须只在该段内匹配，不能在整份 dump 里 grep：本机未连耳机时全文命中
+# AUDIO_DEVICE_OUT_BLUETOOTH* 达 172 次，几乎全来自 "Hardware modules"
+# 里的能力表（形如 {"bt_a2dp_out"; {AUDIO_DEVICE_OUT_BLUETOOTH_A2DP, @:}}，
+# 注意 @: 后面是空的），那只是"这套 HAL 支持哪些设备类型"，与是否连着无关。
+# 真正相连的端口长这样（@: 后面是 MAC）：
+#   4. Port ID: 1265; "bt_sco_headset"; {AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET, @:18:5C:...}
 bt_audio_active() {
-    DUMP=$(dumpsys media.audio_policy 2>/dev/null)
-    if [ -n "$DUMP" ]; then
-        if printf '%s\n' "$DUMP" | grep -qE 'AUDIO_DEVICE_OUT_(BLUETOOTH_A2DP|BLUETOOTH_SCO|BLE_HEADSET|BLE_SPEAKER)'; then
-            return 0
-        fi
-        # 该 ROM 的 dump 里没有设备表时才回落到蓝牙管理器，避免无谓的第二次 dumpsys
-        case "$DUMP" in
-        *"Available output devices"*) return 1 ;;
-        esac
-    fi
+    RES=$(dumpsys media.audio_policy 2>/dev/null | awk '
+        /^ Available output devices/ { seen = 1; in_out = 1; next }
+        in_out && /^ [A-Za-z]/ { in_out = 0 }
+        in_out && /^  [0-9]+\. Port ID:/ &&
+            /AUDIO_DEVICE_OUT_(BLUETOOTH_A2DP|BLUETOOTH_SCO|BLE_HEADSET|BLE_SPEAKER)/ { bt = 1 }
+        END { print (seen ? (bt ? "bt" : "none") : "nosec") }
+    ')
+    case "$RES" in
+    bt) return 0 ;;
+    nosec) ;; # 该 ROM 的 dump 没有可用设备段，回落到蓝牙管理器
+    *) return 1 ;;
+    esac
     dumpsys bluetooth_manager 2>/dev/null | grep -A4 -E 'A2DP:|LE_AUDIO:' | grep -qi 'ACTIVE'
 }
 
@@ -206,12 +215,12 @@ while true; do
                 MODE=high
                 TICK_HIGH=0
                 FG_FAIL=0
-                log "应用要求保护，进入高频解冻（2 秒一次）"
+                log "应用要求保护，进入高频解冻（5 秒一次）"
             fi
             thaw
             TICK_HIGH=$((TICK_HIGH + 1))
             # 一分钟做一次状态复查：开关、前台服务是否还在
-            if [ $((TICK_HIGH % 30)) -eq 0 ]; then
+            if [ $((TICK_HIGH % 12)) -eq 0 ]; then
                 if ! announce_enabled; then
                     # 标记归 app 所有，模块只读不删：删掉后 app 若还活着就不会重建，
                     # 会退化成永久不保护。这里只降级，等 app 下次拉起刷新 mtime
@@ -231,8 +240,8 @@ while true; do
                 else
                     FG_FAIL=$((FG_FAIL + 1))
                     if [ "$FG_FAIL" -ge 3 ]; then
-                        # 连续 3 次复查失败（约 1 分钟）：标记多半是应用被杀后留下的，
-                        # 继续 2 秒空转会让用户直观感受到"这模块费电"
+                        # 连续 3 次复查失败（复查每分钟一次，约 3 分钟）：标记多半是应用被杀后留下的，
+                        # 继续高频空转会让用户直观感受到"这模块费电"
                         STALE_BLOCK=1
                         FLAG_MTIME=$(stat -c %Y "$FLAG" 2>/dev/null)
                         MODE=low
@@ -245,11 +254,13 @@ while true; do
                     log "前台服务复查失败（$FG_FAIL/3）"
                 fi
             fi
-            if [ $((TICK_HIGH % 300)) -eq 0 ]; then
+            if [ $((TICK_HIGH % 120)) -eq 0 ]; then
                 log "心跳 模式=high pid=$PID 累计解冻=$THAW_COUNT"
                 rotate_log
             fi
-            sleep 2
+            # 5 秒而非 2 秒：实测息屏下 sleep 精度很差，2 秒节奏平均 7.7 秒才醒一次，
+            # 相当于用"每 2 秒一次唤醒"的代价买到"7 秒一次的实际解冻"，纯亏
+            sleep 5
             continue
         fi
     elif [ -n "$FREEZE_PID" ]; then
