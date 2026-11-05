@@ -60,7 +60,7 @@ public class NotificationReaderService extends NotificationListenerService {
         }
     };
 
-    /** 轮询间隔可在设置里调整，默认 1.5 秒。 */
+    /** 轮询间隔可在设置里调整，默认 5 秒（1–30 秒可选）。 */
     private long pollInterval() {
         int value = getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE)
                 .getInt(MainActivity.KEY_POLL_INTERVAL, MainActivity.DEFAULT_POLL_INTERVAL_MS);
@@ -188,9 +188,9 @@ public class NotificationReaderService extends NotificationListenerService {
     private static final String PREF_HEARTBEAT_ELAPSED = "heartbeat_elapsed_ms";
     private static final String PREF_INTERRUPTION_LOG = "interruption_log";
     /** 超过这个间隔没有心跳，就认为进程在这段时间里不在了。 */
-    private static final long HEARTBEAT_GAP_THRESHOLD_MS = 180_000L;
-    /** 心跳写盘节流，避免每 5 秒都写一次 SharedPreferences。 */
-    private static final long HEARTBEAT_WRITE_INTERVAL_MS = 60_000L;
+    private static final long HEARTBEAT_GAP_THRESHOLD_MS = 420_000L;
+    /** 心跳写盘节流：每次都是一次 XML 重写 + fsync，60 秒太频繁了。 */
+    private static final long HEARTBEAT_WRITE_INTERVAL_MS = 180_000L;
     private long lastHeartbeatWriteMs;
 
     /**
@@ -290,19 +290,32 @@ public class NotificationReaderService extends NotificationListenerService {
     private long lastPollLogMs;
     private long lastCallbackMs;
     private long lastBluetoothCheckMs;
-    private boolean lastBluetoothState;
-    private static final long BLUETOOTH_CHECK_INTERVAL_MS = 1000L;
+    private volatile boolean lastBluetoothState;
+    /** 音频设备回调已经给出过状态时置 true，之后不再定时查 binder。 */
+    private volatile boolean bluetoothStateFromCallback;
+    /** 兜底：万一某个 ROM 不发设备回调，最多 10 分钟强制重查一次。 */
+    private static final long BLUETOOTH_STATE_MAX_AGE_MS = 600_000L;
 
     private final AudioDeviceCallback audioDeviceCallback = new AudioDeviceCallback() {
         @Override
+        public void onAudioDevicesAdded(AudioDeviceInfo[] addedDevices) {
+            refreshBluetoothStateFromCallback();
+        }
+
+        @Override
         public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
-            if (!MainActivity.hasBluetoothAudioOutput(NotificationReaderService.this)) {
+            refreshBluetoothStateFromCallback();
+            if (!lastBluetoothState) {
                 Log.i(TAG, "Bluetooth audio output removed; clearing queue and stopping speech.");
                 recordEvent("蓝牙音频已断开（队列已清空）");
                 pendingAnnouncements.clear();
                 activeUtterances.clear();
                 if (textToSpeech != null) {
                     textToSpeech.stop();
+                    // 拔了耳机就没人听：把引擎整个放掉，否则它会一直 bind 在本进程里
+                    textToSpeech.shutdown();
+                    textToSpeech = null;
+                    ttsReady = false;
                 }
                 // 不能只等 TTS 回调来恢复音量：部分引擎对被排队的 utterance
                 // 根本不回调 onStop，音量会卡在高位最长 2 分钟。
@@ -390,16 +403,28 @@ public class NotificationReaderService extends NotificationListenerService {
     }
 
     /**
-     * 蓝牙连接状态缓存 1 秒，避免轮询和每条通知重复跨进程查询音频设备列表。
+     * 蓝牙连接状态：优先用 audioDeviceCallback 维护的结果。
+     * 早先缓存只有 1 秒，等于每个轮询 tick（5 秒）都要 getDevices() 跨进程一次，
+     * 一天一万七千多次；而设备变化本来就有系统回调，没必要自己轮。
      */
     private boolean isBluetoothConnected() {
         long now = SystemClock.elapsedRealtime();
-        if (now - lastBluetoothCheckMs < BLUETOOTH_CHECK_INTERVAL_MS) {
+        if (bluetoothStateFromCallback && now - lastBluetoothCheckMs < BLUETOOTH_STATE_MAX_AGE_MS) {
+            return lastBluetoothState;
+        }
+        if (now - lastBluetoothCheckMs < 5000L) {
             return lastBluetoothState;
         }
         lastBluetoothState = MainActivity.hasBluetoothAudioOutput(this);
         lastBluetoothCheckMs = now;
         return lastBluetoothState;
+    }
+
+    /** 设备增删时刷新一次状态，并标记"后续以回调为准"。 */
+    private void refreshBluetoothStateFromCallback() {
+        lastBluetoothState = MainActivity.hasBluetoothAudioOutput(this);
+        bluetoothStateFromCallback = true;
+        lastBluetoothCheckMs = SystemClock.elapsedRealtime();
     }
 
     private void ensureTtsInitialized() {

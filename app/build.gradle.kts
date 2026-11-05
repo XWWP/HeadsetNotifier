@@ -10,8 +10,8 @@ android {
         applicationId = "com.sakura.airannounce"
         minSdk = 26
         targetSdk = 34
-        versionCode = 21
-        versionName = "2.7.4"
+        versionCode = 22
+        versionName = "2.7.5"
     }
 }
 

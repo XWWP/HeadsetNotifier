@@ -67,10 +67,7 @@ public class KeepAliveService extends Service {
         createNotificationChannel();
         // 标记"当前需要防冻结保护"，供 system 层的解冻守护脚本读取。
         // 没有这个文件时，守护脚本会降到极低频率，避免无谓唤醒。
-        try {
-            activeFlagFile().createNewFile();
-        } catch (java.io.IOException ignored) {
-        }
+        touchActiveFlag();
         // 开机或进程被重新拉起后，通知监听服务不一定处于绑定状态，主动请求一次重绑。
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
                 () -> NotificationReaderService.requestRebindIfNeeded(this), 1500L);
@@ -78,6 +75,22 @@ public class KeepAliveService extends Service {
 
     private java.io.File activeFlagFile() {
         return new java.io.File(getFilesDir(), "active");
+    }
+
+    /**
+     * 创建或刷新保护标记。
+     * 守护脚本用 mtime 判断这个标记背后还有没有活着的进程：标记只由 app 写，
+     * 模块只读不删，这样不会出现"模块删了标记、app 没重建导致永久不保护"。
+     */
+    private void touchActiveFlag() {
+        try {
+            java.io.File flag = activeFlagFile();
+            if (!flag.exists()) {
+                flag.createNewFile();
+            }
+            flag.setLastModified(System.currentTimeMillis());
+        } catch (java.io.IOException ignored) {
+        }
     }
 
     @Override
@@ -99,6 +112,8 @@ public class KeepAliveService extends Service {
             return START_NOT_STICKY;
         }
         running = true;
+        // 每次被拉起（包括模块主动 wake_app）都刷新一次，作为"标记还活着"的信号
+        touchActiveFlag();
         return START_STICKY;
     }
 

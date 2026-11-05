@@ -70,6 +70,10 @@ LAST_FAIL_LOG=0
 WAKE_LOG_PID=""
 ENABLED=1
 RETRY=0
+# 标记被判陈旧后置 1：只有 app 重新 touch（mtime 变化）才恢复高频，
+# 避免残留标记让 2 秒循环整夜空转
+STALE_BLOCK=0
+FLAG_MTIME=0
 log "系统就绪，开始守护"
 
 app_pid() {
@@ -121,8 +125,10 @@ freeze_file_of() {
 }
 
 thaw() {
-    [ -n "$FREEZE_FILE" ] && [ -f "$FREEZE_FILE" ] || return 0
-    [ "$(cat "$FREEZE_FILE" 2>/dev/null)" = "1" ] || return 0
+    [ -n "$FREEZE_FILE" ] && [ -r "$FREEZE_FILE" ] || return 0
+    # read 是 shell 内置，不 fork；原来每 tick 用 $(cat) 会多起一个进程
+    read -r FROZEN <"$FREEZE_FILE" 2>/dev/null || return 0
+    [ "$FROZEN" = "1" ] || return 0
     if ! echo 0 >"$FREEZE_FILE" 2>/dev/null; then
         if [ "$THAW_ERR" = "0" ]; then
             THAW_ERR=1
@@ -131,7 +137,9 @@ thaw() {
         return 0
     fi
     THAW_COUNT=$((THAW_COUNT + 1))
-    NOW=$(date +%s)
+    # /proc/uptime 含 suspend 时间且单调，比每 tick fork 一个 date 便宜
+    read -r UP _ </proc/uptime
+    NOW=${UP%.*}
     if [ $((NOW - LAST_THAW_LOG)) -ge 30 ]; then
         LAST_THAW_LOG=$NOW
         log "解冻 pid=$PID（累计 $THAW_COUNT 次）"
@@ -158,6 +166,8 @@ wake_app() {
 }
 
 foreground_ok() {
+    # 进程都不在了就没必要跑一次全量 dumpsys
+    [ -n "$PID" ] && [ -r "/proc/$PID/cmdline" ] || return 1
     dumpsys activity services "$PKG" 2>/dev/null | grep -q 'isForeground=true'
 }
 
@@ -181,7 +191,17 @@ while true; do
             fi
         fi
 
-        if [ -f "$FLAG" ]; then
+        # 标记被判陈旧后，只有 app 重新 touch（mtime 变化）才恢复高频
+        if [ "$STALE_BLOCK" = "1" ]; then
+            CUR_MTIME=$(stat -c %Y "$FLAG" 2>/dev/null)
+            if [ -n "$CUR_MTIME" ] && [ "$CUR_MTIME" != "$FLAG_MTIME" ]; then
+                STALE_BLOCK=0
+                FLAG_MTIME=$CUR_MTIME
+                log "保护标记已刷新，恢复高频保护"
+            fi
+        fi
+
+        if [ -f "$FLAG" ] && [ "$STALE_BLOCK" != "1" ]; then
             if [ "$MODE" != "high" ]; then
                 MODE=high
                 TICK_HIGH=0
@@ -193,11 +213,13 @@ while true; do
             # 一分钟做一次状态复查：开关、前台服务是否还在
             if [ $((TICK_HIGH % 30)) -eq 0 ]; then
                 if ! announce_enabled; then
-                    # 开关已关就没有保护的必要，顺手清掉过期标记避免空转
-                    rm -f "$FLAG" 2>/dev/null
+                    # 标记归 app 所有，模块只读不删：删掉后 app 若还活着就不会重建，
+                    # 会退化成永久不保护。这里只降级，等 app 下次拉起刷新 mtime
                     MODE=low
                     ENABLED=0
-                    log "播报开关已关闭，清掉保护标记，退回低频待机"
+                    STALE_BLOCK=1
+                    FLAG_MTIME=$(stat -c %Y "$FLAG" 2>/dev/null)
+                    log "播报开关已关闭，退回低频待机（保留标记，等应用刷新）"
                     sleep 20
                     continue
                 fi
@@ -206,9 +228,21 @@ while true; do
                         FG_FAIL=0
                         log "前台服务复查恢复正常"
                     fi
-                elif [ "$FG_FAIL" -lt 2 ]; then
+                else
                     FG_FAIL=$((FG_FAIL + 1))
-                    [ "$FG_FAIL" -ge 2 ] && log "前台服务复查失败：保护标记可能已过期"
+                    if [ "$FG_FAIL" -ge 3 ]; then
+                        # 连续 3 次复查失败（约 1 分钟）：标记多半是应用被杀后留下的，
+                        # 继续 2 秒空转会让用户直观感受到"这模块费电"
+                        STALE_BLOCK=1
+                        FLAG_MTIME=$(stat -c %Y "$FLAG" 2>/dev/null)
+                        MODE=low
+                        TICK_HIGH=0
+                        FG_FAIL=0
+                        log "前台服务连续 3 次复查失败，判定保护标记陈旧：暂停高频解冻"
+                        sleep 20
+                        continue
+                    fi
+                    log "前台服务复查失败（$FG_FAIL/3）"
                 fi
             fi
             if [ $((TICK_HIGH % 300)) -eq 0 ]; then
