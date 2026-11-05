@@ -1,0 +1,6 @@
+status=success
+sha=69949b9d6eed74edd09cd5a6c6dc12889cf94e3f
+ref=v2.7.5
+run=https://github.com/XWWP/HeadsetNotifier/actions/runs/42028497928
+built_at=2026-11-05T12:37:24Z
+apk_sha256=0be46985b8cbde99a048a225c6434ea1f263d36ace45a60faed5525e9f6fa986
