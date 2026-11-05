@@ -121,3 +121,21 @@ git show origin/ci-status:ci-status.txt
 5. 磁贴切开关后回首页，开关与状态胶囊是否一致。
 
 界面相关改动至少回归：主界面、五个二级弹窗、应用选择页、高级设置里的 Shizuku 区块。
+
+## 文档索引
+
+| 文件 | 内容 |
+| --- | --- |
+| `docs/POWER-REVIEW.md` | 功耗与检测策略评审（对象：2.7.4 + keepalive v1.2，commit `79bc560`） |
+| `docs/POWER-REVIEW-RESPONSE.md` | 上述评审的处置记录（2.7.5）：逐条采纳/不采纳、理由、尚待真机验证项 |
+
+接手时如果要做功耗相关改动，**先读处置记录**，里面写清了哪些提案已经被否掉、为什么否，避免重复讨论。
+
+## 模块与 app 的约定（重要）
+
+`keepalive/service.sh` 与 app 通过两个信号协作，改任何一侧都要同时看另一侧：
+
+- **`files/active`**：app 在 `KeepAliveService.onCreate/onStartCommand` 创建并刷新（mtime 就是"活体信号"），`onDestroy` 删除。**模块只读不删**——模块删掉而 app 还活着，标记不会重建，会退化成永久不保护。
+- **`MODE=high` 的退出条件**：前台服务连续 3 次复查失败、或播报开关关闭，模块只把自身置 `low` 并记 `STALE_BLOCK`，等 app 下次拉起刷新 mtime 自动恢复。
+
+改这块最容易出的问题是"以为在保护、其实没有"，所以任何改动都要在真机上 `tail -f keepalive.log` 看一遍节奏。
