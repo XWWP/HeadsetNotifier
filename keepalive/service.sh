@@ -3,7 +3,7 @@
 #
 # ColorOS 等 ROM 会把「耳机通知播报」进程放进 cgroup freezer，冻住后收不到通知，
 # 播报静默中断。本脚本常驻，只做两件事：
-#   1. 应用声明需要保护时（files/active 标记），每 2 秒解冻一次；
+#   1. 应用声明需要保护时（files/active 标记），每 5 秒解冻一次；
 #   2. 其余时间每 20 秒探测一次蓝牙音频，连着就解冻并拉起应用，由应用自己接管。
 #
 # 排查：日志写在模块目录 keepalive.log，进程号 / 冻结文件 / 解冻次数都会记录。
@@ -58,6 +58,7 @@ sleep 10
 MODE=low
 TICK_HIGH=0
 TICK_IDLE=0
+TICK_BT=0
 THAW_COUNT=0
 THAW_ERR=0
 FG_FAIL=0
@@ -279,6 +280,18 @@ while true; do
         if bt_audio_active; then
             thaw
             wake_app
+            # 耳机判定成功但没标记时，以前完全静默：日志只有"模式=low"，
+            # 分不清"没认出耳机"和"认出了但没有要拉起的对象"，排查时会误判成前者。
+            TICK_BT=$((TICK_BT + 1))
+            if [ $((TICK_BT % 30)) -eq 0 ]; then
+                if [ -f "$FLAG" ]; then
+                    log "待机中检测到蓝牙音频输出，已尝试拉起（保护标记在）"
+                else
+                    log "待机中检测到蓝牙音频输出，已尝试拉起（无保护标记：应用未要求保护）"
+                fi
+            fi
+        else
+            TICK_BT=0
         fi
     elif [ "$ENABLED" != "0" ]; then
         ENABLED=0
