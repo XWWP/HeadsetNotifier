@@ -65,6 +65,17 @@
 - **两组参数不同**：high 组用 5 秒采样、low 组用 2 秒采样。若冻结发生，low 组被抓到的概率更高，因此"两组都是 0"不能反推"两组冻结率相同"。
 - **没有同时记录整机耗电**：本次只测冻结状态，没有 `batterystats` 对照，所以无法给出"5 秒比 2 秒省多少电"的数字。
 
+## 原始数据
+
+| 组 | 文件 | 行数 |
+| --- | --- | --- |
+| 1 亮屏/high | `docs/measurements/interval-g1-bright-high5s-20261106-025612.log` | 121 |
+| 2 亮屏/low | `docs/measurements/interval-g2-bright-low20s-20261106-030748.log` | 300 |
+| 3 息屏/high | `docs/measurements/interval-g3-off-high5s-20261106-031834.log` | 121 |
+| 4 息屏/low | `docs/measurements/interval-g4-off-low20s-20261106-040623.log` | 301 |
+
+格式：`<unix 时间戳> <cgroup.freeze 值> <pid>`，每行一次采样。
+
 ## 下一步该做什么（如果还要继续优化功耗）
 
 1. **先造出可复现的冻结**，否则任何节奏调参都是在没有分母的情况下投票。候选手段：守护暂停 + 息屏 + `cmd deviceidle force-idle` + 等 5–10 分钟，或长按后台任务清理让系统主动 freeze。
