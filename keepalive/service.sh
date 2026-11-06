@@ -163,22 +163,50 @@ thaw() {
     fi
 }
 
-# 只拉起保活前台服务：应用自己会 requestRebind 通知监听，不用再动监听授权
+# 屏幕是否亮着。亮屏时不拉起：am start-activity 会把应用切到前台，打断用户
+# 正在做的事。只有息屏（Asleep/Dreaming）才值得拉，黑屏下多一次唤醒换来播报恢复。
+# 只在 wake_app 里用，且已被 60 秒限流挡住，实际最多每分钟一次 dumpsys。
+screen_is_awake() {
+    dumpsys power 2>/dev/null | grep -m1 'mWakefulness=' | grep -q 'Awake'
+}
+
+# 拉起应用进程。
+# 不能用 am start-foreground-service：KeepAliveService 是 exported="false"，
+# 跨 uid 启动会被拒（实测 ColorOS 的 OplusHansManager 代理后返回
+# "Not found; no service started."），这条命令从未真正成功过；而旧版只要看到
+# "PID 非空"就记「拉起成功」，进程本来就在时纯属假阳性。
+# MainActivity 是 exported="true"，能把进程真正叫起来；代价是会切到应用界面，
+# 所以只在进程确实不存在、且屏幕已熄灭时才拉。
 wake_app() {
+    [ -n "$(app_pid)" ] && return 0
     NOW=$(date +%s)
     [ $((NOW - LAST_WAKE)) -ge 60 ] || return 0
     LAST_WAKE=$NOW
-    am start-foreground-service -n "$PKG/.KeepAliveService" >/dev/null 2>&1
+    if screen_is_awake; then
+        if [ $((NOW - LAST_FAIL_LOG)) -ge 300 ]; then
+            LAST_FAIL_LOG=$NOW
+            log "进程不在，但屏幕亮着，暂不拉起（等息屏）"
+        fi
+        return 0
+    fi
+    WAKE_OUT=$(am start-activity --user 0 -n "$PKG/.MainActivity" 2>&1)
     sleep 3
     NEW_PID=$(app_pid)
-    if [ -n "$NEW_PID" ]; then
-        if [ "$NEW_PID" != "$WAKE_LOG_PID" ]; then
-            WAKE_LOG_PID=$NEW_PID
-            log "拉起成功 pid=$NEW_PID"
+    if [ -z "$NEW_PID" ]; then
+        if [ $((NOW - LAST_FAIL_LOG)) -ge 300 ]; then
+            LAST_FAIL_LOG=$NOW
+            log "拉起失败：进程未出现（检查后台启动限制）am=$(printf '%s' "$WAKE_OUT" | head -n1)"
         fi
-    elif [ $((NOW - LAST_FAIL_LOG)) -ge 300 ]; then
-        LAST_FAIL_LOG=$NOW
-        log "拉起失败：进程未出现（检查通知权限 / 后台启动限制）"
+        return 0
+    fi
+    if [ "$NEW_PID" != "$WAKE_LOG_PID" ]; then
+        WAKE_LOG_PID=$NEW_PID
+        if printf '%s' "$WAKE_OUT" | grep -qi "error"; then
+            # am 被拒但进程自己回来了（比如系统重绑通知监听），也算恢复
+            log "进程自行恢复 pid=$NEW_PID（am 返回拒绝）"
+        else
+            log "息屏拉起成功 pid=$NEW_PID"
+        fi
     fi
 }
 
@@ -266,8 +294,8 @@ while true; do
                 log "心跳 模式=high pid=$PID 累计解冻=$THAW_COUNT"
                 rotate_log
             fi
-            # 5 秒而非 2 秒：实测息屏下 sleep 精度很差，2 秒节奏平均 7.7 秒才醒一次，
-            # 相当于用"每 2 秒一次唤醒"的代价买到"7 秒一次的实际解冻"，纯亏
+            # 5 秒而非 2 秒：四组实测 sleep 精度正常（设定 5 秒实测 5.0 秒、设定 2 秒实测 2.0 秒），
+            # 改成 5 秒是把唤醒次数降到 1/2.5，而 2 秒能买到的解冻速度优势测不出来，取更省电的一侧
             sleep 5
             continue
         fi

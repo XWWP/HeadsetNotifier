@@ -170,3 +170,56 @@ readlink /proc/$(cat /data/adb/modules/airannounce-thaw/keepalive.pid)/ns/mnt
 ```
 
 开机时由 KernelSU/Magisk 执行模块 `service.sh`，默认就在正常命名空间，不受影响——**只有手动重启才会踩这个坑**。脚本已内置自检：启动时若看不到 `$DATA` 会记一条明确告警，不要忽略它。
+## 2026-11-06：wake_app 拉起方式修复（v1.5 / versionCode 6）
+
+### 问题
+
+旧 `wake_app()` 用 `am start-foreground-service -n "$PKG/.KeepAliveService"` 拉起应用。
+但 `KeepAliveService` 在 manifest 里是 `exported="false"`，跨 uid（root/shell → app）启动会被拒：
+
+```
+$ am start-service -n com.sakura.airannounce/.KeepAliveService
+Error: Not found; no service started.
+
+$ logcat | grep Hans
+I OplusHansManager: proxyService 10645/com.sakura.airannounce
+  [com.sakura.airannounce.KeepAliveService/null] calling 0/com.android.shell
+```
+
+ColorOS 的 `OplusHansManager` 接管了启动请求后返回失败，所以这条命令**从未真正成功过**。
+
+更糟的是判定逻辑：只要 `app_pid` 非空就记「拉起成功」。进程本来就在时，日志会写
+`拉起成功 pid=xxx`，制造假阳性（10:47:46 那条就是）。
+
+### 修复
+
+- 改用 `am start-activity --user 0 -n "$PKG/.MainActivity"`（MainActivity 是 `exported="true"`）
+- 只在 `app_pid` 确实为空时才拉，避免把界面强行切到前台打扰用户
+- 判定改为检查 am 输出是否含 `error`，并区分「拉起成功」与「进程自行恢复」
+
+### 验证（2026-11-06 10:59）
+
+```
+$ am kill --user 0 com.sakura.airannounce   # 进程消失
+（20 秒内）
+10:59:02 拉起成功 pid=15760
+```
+
+拉起后系统状态：
+
+```
+PID=15760 adj=50
+ServiceRecord .../.KeepAliveService
+  isForeground=true foregroundId=1001 types=0x00000010   # CONNECTED_DEVICE
+```
+
+`adj` 从 704（后台服务级）升到 50，前台服务真正生效。
+
+关键区别：从 Activity 拉起时应用处于前台，`startForegroundService` 才被允许；
+直接从后台启服务会被 ColorOS 拦掉。
+
+### 遗留
+
+- 应用侧 `KeepAliveService.start()` 在后台场景仍可能被拒，需要 Activity 作为踏板；
+  这是 ROM 行为，不是代码 bug。
+- 本次未改 `foregroundServiceType`、权限与电池白名单（实测都已正确）。
