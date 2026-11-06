@@ -461,7 +461,7 @@ public class MainActivity extends Activity {
         } else if (sensitiveState == -1) {
             sensitiveDesc = "已被禁止，微信、QQ 等通知读不到内容";
         } else {
-            sensitiveDesc = "需在「通知使用权」里开启，否则聊天通知可能读不到";
+            sensitiveDesc = "系统未暴露检测接口，若聊天通知读不到请点此开启";
         }
         card.addView(createPermRow(sensitiveState == 1, "敏感通知权限", sensitiveDesc,
                 android15 && sensitiveState != 1, this::openSensitiveNotificationSettings,
@@ -1429,37 +1429,84 @@ public class MainActivity extends Activity {
             return 1;
         }
         // Android 15+ 的判定入口在公开 SDK 里不一定可见（本机 compileSdk 35 的
-        // android.jar 就没有该常量），而且各代 AOSP 的 AppOps 名字不一样：
-        // 先试官方函数可用性，再试两个已知 op 名，全部失败就返回「无法判断」。
+        // android.jar 就没有该常量），各代 ROM 的 op 名也不一致，这里三层兜底：
+        //   1. 官方函数 canUseNotificationFunction
+        //   2. 常见字符串 op 名（"android:xxx" 形式）
+        //   3. getOpByName 拿数字编号再查（hidden API，失败就算了）
+        // 全部失败返回 0（无法判断），界面按「检测受限」提示，不再断言未开启。
         Boolean byFunction = checkSensitiveByNotificationFunction();
         if (byFunction != null) {
             return byFunction ? 1 : -1;
         }
-        String[] opNames = {
-                "android:receive_sensitive_notification",
-                "android:access_internally_sent_notifications",
-        };
         android.app.AppOpsManager ops = (android.app.AppOpsManager)
                 getSystemService(APP_OPS_SERVICE);
         if (ops == null) {
             return 0;
         }
+        // 之前这里只写了 "android:receive_sensitive_notification"，
+        // 在本机（ColorOS / Android 15）对不上，检测永远失败，
+        // 界面就会一直显示「需开启」——即使 appops 里其实是 allow。
+        String[] opNames = {
+                "android:receive_sensitive_notification",
+                "android:receive_sensitive_notifications",
+                "android:access_internally_sent_notifications",
+        };
         for (String opName : opNames) {
+            Integer state = stateOfMode(unsafeMode(ops, opName));
+            if (state != null) {
+                return state;
+            }
+        }
+        Integer op = opByName("RECEIVE_SENSITIVE_NOTIFICATIONS");
+        if (op != null) {
             try {
-                int mode = ops.unsafeCheckOpNoThrow(opName, android.os.Process.myUid(),
-                        getPackageName());
-                if (mode == android.app.AppOpsManager.MODE_ALLOWED) {
-                    return 1;
-                }
-                if (mode == android.app.AppOpsManager.MODE_IGNORED
-                        || mode == android.app.AppOpsManager.MODE_ERRORED) {
-                    return -1;
+                java.lang.reflect.Method method = android.app.AppOpsManager.class
+                        .getMethod("unsafeCheckOpNoThrow", int.class, int.class, String.class);
+                Object value = method.invoke(ops, op, android.os.Process.myUid(), getPackageName());
+                Integer state = stateOfMode(value instanceof Integer ? (Integer) value : null);
+                if (state != null) {
+                    return state;
                 }
             } catch (Throwable ignored) {
-                // 这台 ROM 没有这个 op：换下一个名字，不代表用户被禁止
+                // hidden API 被拦或该 ROM 没有这个方法
             }
         }
         return 0;
+    }
+
+    private Integer unsafeMode(android.app.AppOpsManager ops, String opName) {
+        try {
+            return ops.unsafeCheckOpNoThrow(opName, android.os.Process.myUid(), getPackageName());
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private Integer stateOfMode(Integer mode) {
+        if (mode == null) {
+            return null;
+        }
+        if (mode == android.app.AppOpsManager.MODE_ALLOWED) {
+            return 1;
+        }
+        if (mode == android.app.AppOpsManager.MODE_IGNORED
+                || mode == android.app.AppOpsManager.MODE_ERRORED) {
+            return -1;
+        }
+        return null;
+    }
+
+    private Integer opByName(String name) {
+        try {
+            java.lang.reflect.Method method = android.app.AppOpsManager.class
+                    .getMethod("getOpByName", String.class);
+            Object value = method.invoke(null, name);
+            if (value instanceof Integer && (Integer) value >= 0) {
+                return (Integer) value;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     /** 反射问 NotificationManager#canUseNotificationFunction，拿不到就返回 null。 */
