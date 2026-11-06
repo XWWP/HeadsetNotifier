@@ -163,50 +163,31 @@ thaw() {
     fi
 }
 
-# 屏幕是否亮着。亮屏时不拉起：am start-activity 会把应用切到前台，打断用户
-# 正在做的事。只有息屏（Asleep/Dreaming）才值得拉，黑屏下多一次唤醒换来播报恢复。
-# 只在 wake_app 里用，且已被 60 秒限流挡住，实际最多每分钟一次 dumpsys。
-screen_is_awake() {
-    dumpsys power 2>/dev/null | grep -m1 'mWakefulness=' | grep -q 'Awake'
-}
-
 # 拉起应用进程。
-# 不能用 am start-foreground-service：KeepAliveService 是 exported="false"，
-# 跨 uid 启动会被拒（实测 ColorOS 的 OplusHansManager 代理后返回
-# "Not found; no service started."），这条命令从未真正成功过；而旧版只要看到
-# "PID 非空"就记「拉起成功」，进程本来就在时纯属假阳性。
-# MainActivity 是 exported="true"，能把进程真正叫起来；代价是会切到应用界面，
-# 所以只在进程确实不存在、且屏幕已熄灭时才拉。
+# 用显式广播打到应用里的 WakeReceiver：进程被拉起后在本进程内启动前台服务，
+# 不弹界面、不点亮屏幕，亮屏息屏都能用。
+# 不能用 am start*-service：KeepAliveService 是 exported="false"，跨 uid 启动会被
+# 拒（实测 ColorOS 的 OplusHansManager 返回 "Not found"）。
+# 也不再用 am start-activity：会切前台并点亮屏幕，打扰用户（v1.5 的做法）。
 wake_app() {
     [ -n "$(app_pid)" ] && return 0
     NOW=$(date +%s)
     [ $((NOW - LAST_WAKE)) -ge 60 ] || return 0
     LAST_WAKE=$NOW
-    if screen_is_awake; then
-        if [ $((NOW - LAST_FAIL_LOG)) -ge 300 ]; then
-            LAST_FAIL_LOG=$NOW
-            log "进程不在，但屏幕亮着，暂不拉起（等息屏）"
-        fi
-        return 0
-    fi
-    WAKE_OUT=$(am start-activity --user 0 -n "$PKG/.MainActivity" 2>&1)
+    WAKE_OUT=$(am broadcast --user 0 --include-stopped-packages \
+        -a "$PKG.WAKE" -n "$PKG/.WakeReceiver" 2>&1)
     sleep 3
     NEW_PID=$(app_pid)
     if [ -z "$NEW_PID" ]; then
         if [ $((NOW - LAST_FAIL_LOG)) -ge 300 ]; then
             LAST_FAIL_LOG=$NOW
-            log "拉起失败：进程未出现（检查后台启动限制）am=$(printf '%s' "$WAKE_OUT" | head -n1)"
+            log "拉起失败：进程未出现（检查应用是否为 2.7.6+）am=$(printf '%s' "$WAKE_OUT" | head -n1)"
         fi
         return 0
     fi
     if [ "$NEW_PID" != "$WAKE_LOG_PID" ]; then
         WAKE_LOG_PID=$NEW_PID
-        if printf '%s' "$WAKE_OUT" | grep -qi "error"; then
-            # am 被拒但进程自己回来了（比如系统重绑通知监听），也算恢复
-            log "进程自行恢复 pid=$NEW_PID（am 返回拒绝）"
-        else
-            log "息屏拉起成功 pid=$NEW_PID"
-        fi
+        log "拉起成功 pid=$NEW_PID"
     fi
 }
 

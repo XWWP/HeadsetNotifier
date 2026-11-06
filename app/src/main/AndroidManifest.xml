@@ -67,6 +67,12 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+        <!-- 只给 root 守护脚本用的唤醒入口：显式广播拉起进程并启动前台服务，
+             避免脚本用 am start-activity 弹界面/亮屏。无 intent-filter，
+             只能被显式组件广播命中。 -->
+        <receiver
+            android:name=".WakeReceiver"
+            android:exported="true" />
         <receiver
             android:name=".BluetoothStateReceiver"
             android:exported="false">

@@ -223,3 +223,56 @@ ServiceRecord .../.KeepAliveService
 - 应用侧 `KeepAliveService.start()` 在后台场景仍可能被拒，需要 Activity 作为踏板；
   这是 ROM 行为，不是代码 bug。
 - 本次未改 `foregroundServiceType`、权限与电池白名单（实测都已正确）。
+
+## 2026-11-06（追加）：v1.6 改用广播拉起，不亮屏
+
+### 为什么再改
+
+v1.5 用 `am start-activity` 拉起 `MainActivity`，实测会把 `mWakefulness` 从
+`Dozing` 打回 `Awake`——息屏状态下会亮屏，用户体验差。
+
+### 方案
+
+应用侧新增 `WakeReceiver`（manifest 里 `exported="true"`、无 intent-filter，
+只能被显式组件广播命中）：
+
+```java
+public void onReceive(Context context, Intent intent) {
+    MainActivity.syncKeepAlive(context);              // 尊重开关 + 当前是否有蓝牙音频
+    NotificationReaderService.requestRebindIfNeeded(context);
+}
+```
+
+模块侧改为：
+
+```sh
+am broadcast --user 0 --include-stopped-packages \
+    -a "$PKG.WAKE" -n "$PKG/.WakeReceiver"
+```
+
+`syncKeepAlive()` 内部会判断：开关关 → 停服务；开且有蓝牙音频 → 启动前台服务；
+开但无音频 → 什么都不做。所以广播不会无条件拉起。
+
+### 实测（息屏场景）
+
+```
+mWakefulness=Dozing
+am force-stop --user 0 com.sakura.airannounce
+（35 秒后）
+PID=25998 adj=200
+mWakefulness=Dozing          ← 屏幕保持熄灭
+isForeground=true types=0x00000010
+日志：11:12:43 拉起成功 pid=25998
+```
+
+对比 v1.5：同样操作后 `mWakefulness` 会变成 `Awake`。
+
+### 版本
+
+- app：2.7.6 / versionCode 23（新增 `WakeReceiver`）
+- 模块：v1.6 / versionCode 7
+
+### 注意
+
+模块广播依赖应用 ≥ 2.7.6；旧版本没有 `WakeReceiver`，广播会失败，
+日志会记「拉起失败：进程未出现（检查应用是否为 2.7.6+）」。
