@@ -163,3 +163,42 @@ docs/
   POWER-REVIEW*.md            功耗评审与回应
   TAKEOVER.md                 本文件
 ```
+
+## 轮询调度改造（2.7.9 / versionCode 26）
+
+### 改了什么
+
+轮询循环不再无条件常驻，改为跟随「开关 + 耳机」两个条件启停：
+
+- `startPolling(delayMs)`：耳机在、播报开着才把 `pollRunnable` 挂上；已在跑时直接返回，
+  不会被 A2DP / HSP 连续两条设备广播反复重置倒计时。
+- `stopPolling()`：耳机一断就 `removeCallbacks(pollRunnable)`，只留 `idleHeartbeatRunnable`。
+  同时 `resetPollingState()` 复位指纹表与 `pollInitialized`，避免重连后把断开期间的
+  旧通知补念一遍。
+- `idleHeartbeatRunnable`（`IDLE_HEARTBEAT_MS = 120_000`）：空闲期每 2 分钟醒一次，
+  作用是 ① 写心跳（实际被 `HEARTBEAT_WRITE_INTERVAL_MS = 180_000` 节流到 3 分钟，
+  远小于 `HEARTBEAT_GAP_THRESHOLD_MS = 420_000` 的断档判定）② 当看门狗：
+  `checkBluetoothFresh()` 强制重查真实音频输出，ROM 没发设备回调时也能在 2 分钟内
+  发现耳机其实连着，把轮询救回来。
+- 状态页诊断多一行 `· 轮询：已暂停（未连接耳机），上次 tick N 秒前`，用来证明轮询
+  是真的停了，而不是"看着没播报"。
+
+调用点：`onCreate` / `onListenerConnected` / `AudioDeviceCallback` 增删 /
+`MainActivity.syncKeepAlive()`（经 `syncPollingIfAvailable()`）。
+
+### 为什么这么改
+
+5 秒 tick 在无耳机时纯属空转：它持续唤醒进程，App 进不了深度空闲。
+而"没有耳机"是常态（一天里占绝大多数时间），这部分唤醒没有任何收益。
+
+**注意：本次只做了一半。** 系统闹钟 / JobScheduler 替代 tick 的部分没做，原因见
+`docs/POLLING-PLAN.md`：`cgroup.freeze` 只有 root 模块或系统投递广播能解冻，
+闹钟在冻结期间投递不可期，替代不了模块；且粒度会退化到 9–15 分钟。
+真正能考察的收益点在这个"耳机在才转"的开关上，先量耗电再决定走不走第二步。
+
+### 验证记录（2026-11-08）
+
+- 装机后无耳机：无 `Polling started` 日志 → 轮询确实没起
+- 心跳文件 mtime 11:59 → 12:03 自行刷新 → 空闲心跳在跑
+- 状态页显示"已暂停"，`lastPollTickMs` 为 0
+- **未验证**：接上耳机后 `Polling started` 与 `轮询：运行中` —— 当时无可用耳机

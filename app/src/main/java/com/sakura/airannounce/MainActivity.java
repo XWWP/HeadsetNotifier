@@ -1003,7 +1003,7 @@ public class MainActivity extends Activity {
         body.addView(pollBar, matchWrap());
 
         TextView pollHint = new TextView(this);
-        pollHint.setText("未连接耳机时不轮询；检测到系统回调恢复正常后自动降频。");
+        pollHint.setText("未连接耳机时完全停掉轮询（只保留 2 分钟空闲心跳）；检测到系统回调恢复正常后自动降频。");
         pollHint.setTextSize(12);
         pollHint.setTextColor(TEXT_TERTIARY);
         pollHint.setPadding(0, dp(4), 0, dp(8));
@@ -1635,6 +1635,8 @@ public class MainActivity extends Activity {
         } else if (hasBluetoothAudioOutput(context)) {
             KeepAliveService.start(context);
         }
+        // 轮询跟着「开关 + 耳机」走：关掉播报或拔了耳机就该停止空转
+        NotificationReaderService.syncPollingIfAvailable();
     }
 
     private void updateStatus() {

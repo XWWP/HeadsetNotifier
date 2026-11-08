@@ -47,6 +47,7 @@ public class NotificationReaderService extends NotificationListenerService {
                 return;
             }
             // 正常情况下无论如何都要把下一次轮询排上，否则一次异常就会让轮询链永久断掉。
+            lastPollTickMs = SystemClock.elapsedRealtime();
             try {
                 writeHeartbeat();
                 pollActiveNotifications();
@@ -78,6 +79,91 @@ public class NotificationReaderService extends NotificationListenerService {
         }
         return value;
     }
+
+    /**
+     * 空闲期唤醒周期：耳机不在时彻底停掉轮询，只按这个周期醒一次。
+     * 两个作用：① 让「进程还活着」的心跳不至于长期断档（写入本来就被 3 分钟节流卡着，
+     * 远小于 7 分钟的断档判定阈值）；② 万一某个 ROM 不发音频设备回调，
+     * 这里能在 2 分钟内发现「其实耳机连着」，把轮询救回来。
+     */
+    private static final long IDLE_HEARTBEAT_MS = 120_000L;
+    /** 轮询循环是否在跑。耳机断开后为 false，此时 pollHandler 上只挂着空闲心跳。 */
+    private volatile boolean pollingActive;
+    /** 上一次轮询 tick 的时刻，用来证明"轮询是不是真的停了"。 */
+    private long lastPollTickMs;
+    private final Runnable idleHeartbeatRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (destroyed) {
+                return;
+            }
+            writeHeartbeat();
+            if (checkBluetoothFresh()) {
+                Log.i(TAG, "Idle watchdog: bluetooth audio back, resuming polling.");
+                recordEvent("空闲看门狗：耳机已连接，恢复轮询");
+                startPolling(1000L);
+                return;
+            }
+            pollHandler.postDelayed(this, IDLE_HEARTBEAT_MS);
+        }
+    };
+
+    /** 开始（或恢复）轮询。已经在跑时不动，避免连续几条设备广播把倒计时反复重置。 */
+    private void startPolling(long delayMs) {
+        pollHandler.removeCallbacks(idleHeartbeatRunnable);
+        if (pollingActive) {
+            return;
+        }
+        pollingActive = true;
+        long delay = Math.max(0L, delayMs);
+        pollHandler.removeCallbacks(pollRunnable);
+        pollHandler.postDelayed(pollRunnable, delay);
+        Log.i(TAG, "Polling started, first tick in " + delay + "ms.");
+    }
+
+    /**
+     * 停掉轮询循环。耳机不在时没有任何播报需求，5 秒一次的 tick 纯属耗电：
+     * 它会持续唤醒进程，让 App 进不了深度空闲。停掉后只留 2 分钟的空闲心跳。
+     *
+     * 同时复位轮询基线（pollInitialized / 指纹表），否则耳机重新连上后
+     * 会把断开期间堆在通知栏里的旧通知补念一遍。
+     */
+    private void stopPolling() {
+        boolean wasActive = pollingActive;
+        pollHandler.removeCallbacks(pollRunnable);
+        pollingActive = false;
+        resetPollingState();
+        writeHeartbeat();
+        if (!destroyed) {
+            pollHandler.removeCallbacks(idleHeartbeatRunnable);
+            pollHandler.postDelayed(idleHeartbeatRunnable, IDLE_HEARTBEAT_MS);
+        }
+        if (wasActive) {
+            Log.i(TAG, "Polling suspended (no bluetooth audio output).");
+            recordEvent("轮询已暂停（未连接耳机）");
+        }
+    }
+
+    /** 让轮询状态跟「开关 + 耳机」两个条件对齐，只在真正的边沿上启停。 */
+    private void syncPollingWithBluetooth() {
+        boolean enabled = getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE)
+                .getBoolean(MainActivity.KEY_ENABLED, true);
+        if (!enabled || !checkBluetoothFresh()) {
+            stopPolling();
+            return;
+        }
+        startPolling(1000L);
+    }
+
+    /** 设置页改完开关后从外部对齐一次（播报关掉时同样要停轮询）。 */
+    static void syncPollingIfAvailable() {
+        NotificationReaderService service = instance;
+        if (service == null) {
+            return;
+        }
+        service.mainHandler.post(service::syncPollingWithBluetooth);
+    }
+
     private final ArrayDeque<PendingAnnouncement> pendingAnnouncements = new ArrayDeque<>();
     private final Map<String, SpokenNotification> recentNotifications = new HashMap<>();
 
@@ -269,7 +355,14 @@ public class NotificationReaderService extends NotificationListenerService {
         builder.append("· TTS：").append(service.ttsReady ? "就绪" : "未就绪").append('\n');
         builder.append("· 待播队列：").append(service.pendingAnnouncements.size())
                 .append(" 条，播放中：").append(service.activeUtterances.size()).append(" 条\n");
-        builder.append("· 轮询间隔：").append(service.pollInterval() / 1000f).append(" 秒\n");
+        long sinceTick = service.lastPollTickMs <= 0L
+                ? -1L
+                : SystemClock.elapsedRealtime() - service.lastPollTickMs;
+        builder.append("· 轮询：").append(service.pollingActive
+                        ? ("运行中，间隔 " + (service.pollInterval() / 1000f) + " 秒")
+                        : "已暂停（未连接耳机）")
+                .append(sinceTick < 0 ? "，尚未跑过" : "，上次 tick " + (sinceTick / 1000L) + " 秒前")
+                .append('\n');
         builder.append("· 最近系统回调：")
                 .append(sinceCallback < 0 ? "尚未收到" : (sinceCallback / 1000L) + " 秒前")
                 .append('\n');
@@ -300,6 +393,11 @@ public class NotificationReaderService extends NotificationListenerService {
         @Override
         public void onAudioDevicesAdded(AudioDeviceInfo[] addedDevices) {
             refreshBluetoothStateFromCallback();
+            // 耳机接上了：轮询和 TTS 引擎到这时候才真正需要存在。
+            if (lastBluetoothState) {
+                ensureTtsInitialized();
+                startPolling(1000L);
+            }
         }
 
         @Override
@@ -321,6 +419,8 @@ public class NotificationReaderService extends NotificationListenerService {
                 // 根本不回调 onStop，音量会卡在高位最长 2 分钟。
                 abandonAudioFocus();
                 restoreVolumeAfterSpeech();
+                // 没有耳机就没人听：轮询也一起停掉，只留空闲心跳。
+                stopPolling();
             }
         }
     };
@@ -351,8 +451,8 @@ public class NotificationReaderService extends NotificationListenerService {
         ensureKeepAliveIfNeeded();
         // 轮询放在这里而不是前台服务里：NotificationListenerService 由系统 bindService 绑定，
         // 生命周期比自建的前台服务稳定得多，被回收的概率低。
-        pollHandler.removeCallbacks(pollRunnable);
-        pollHandler.postDelayed(pollRunnable, pollInterval());
+        // 只在耳机已经连着时才开跑：没有耳机就没有播报需求，没必要每 5 秒醒一次。
+        syncPollingWithBluetooth();
     }
 
     @Override
@@ -361,9 +461,8 @@ public class NotificationReaderService extends NotificationListenerService {
         Log.i(TAG, "onListenerConnected: listener is bound and ready.");
         recordEvent("监听已连接");
         ensureKeepAliveIfNeeded();
-        // 重新绑定后恢复轮询，避免被系统解绑再绑定时轮询已停。
-        pollHandler.removeCallbacks(pollRunnable);
-        pollHandler.postDelayed(pollRunnable, pollInterval());
+        // 重新绑定后按当前条件恢复轮询，避免被系统解绑再绑定时轮询已停。
+        syncPollingWithBluetooth();
     }
 
     @Override
@@ -425,6 +524,13 @@ public class NotificationReaderService extends NotificationListenerService {
         lastBluetoothState = MainActivity.hasBluetoothAudioOutput(this);
         bluetoothStateFromCallback = true;
         lastBluetoothCheckMs = SystemClock.elapsedRealtime();
+    }
+
+    /** 强制重查一次真实状态，不吃回调缓存（空闲看门狗和启停决策必须拿实况）。 */
+    private boolean checkBluetoothFresh() {
+        lastBluetoothState = MainActivity.hasBluetoothAudioOutput(this);
+        lastBluetoothCheckMs = SystemClock.elapsedRealtime();
+        return lastBluetoothState;
     }
 
     private void ensureTtsInitialized() {
