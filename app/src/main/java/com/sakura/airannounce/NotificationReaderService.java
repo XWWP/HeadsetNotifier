@@ -731,6 +731,29 @@ public class NotificationReaderService extends NotificationListenerService {
         }
     }
 
+    /**
+     * 跳过日志的节流。有些应用（代理工具、下载器）把通知当仪表盘，每秒更新一次，
+     * 于是 onNotificationPosted 每秒被系统叫一次；日志不节流的话 logcat 环形缓冲
+     * 会在几十分钟内被同一行刷满，真正的故障现场反而被冲掉。
+     * recordSkip 早就有同样的 60 秒节流，这里补的是日志侧。
+     */
+    private static final long SKIP_LOG_INTERVAL_MS = 60_000L;
+    private final Map<String, Long> lastSkipLogMs = new HashMap<>();
+
+    private void logSkip(String reason, String packageName) {
+        String key = reason + '|' + packageName;
+        long now = SystemClock.elapsedRealtime();
+        Long last = lastSkipLogMs.get(key);
+        if (last != null && now - last < SKIP_LOG_INTERVAL_MS) {
+            return;
+        }
+        if (lastSkipLogMs.size() > 200) {
+            lastSkipLogMs.clear();
+        }
+        lastSkipLogMs.put(key, now);
+        Log.d(TAG, "skip " + reason + ": " + packageName);
+    }
+
     private synchronized void handleNotificationPosted(
             StatusBarNotification statusBarNotification) {
         String packageName = statusBarNotification.getPackageName();
@@ -743,17 +766,17 @@ public class NotificationReaderService extends NotificationListenerService {
         }
         if (!getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE)
                 .getBoolean(MainActivity.KEY_ENABLED, true)) {
-            Log.d(TAG, "skip disabled: " + packageName);
+            logSkip("disabled", packageName);
             recordSkip(packageName, "总开关已关闭");
             return;
         }
         if (!isPackageAllowed(packageName)) {
-            Log.d(TAG, "skip allowlist: " + packageName);
+            logSkip("allowlist", packageName);
             recordSkip(packageName, "不在白名单");
             return;
         }
         if (isInDoNotDisturbWindow()) {
-            Log.d(TAG, "skip dnd window: " + packageName);
+            logSkip("dnd", packageName);
             recordSkip(packageName, "处于勿扰时段");
             return;
         }
@@ -761,13 +784,13 @@ public class NotificationReaderService extends NotificationListenerService {
         Notification notification = statusBarNotification.getNotification();
         if ((notification.flags & (Notification.FLAG_ONGOING_EVENT
                 | Notification.FLAG_GROUP_SUMMARY)) != 0) {
-            Log.d(TAG, "skip ongoing/summary: " + packageName);
+            logSkip("ongoing", packageName);
             recordSkip(packageName, "常驻通知或分组摘要");
             return;
         }
 
         if (!isBluetoothConnected()) {
-            Log.d(TAG, "skip no bluetooth: " + packageName);
+            logSkip("no-bluetooth", packageName);
             recordSkip(packageName, "未连接蓝牙音频");
             pendingAnnouncements.clear();
             return;
@@ -775,12 +798,12 @@ public class NotificationReaderService extends NotificationListenerService {
 
         String announcement = createAnnouncement(statusBarNotification);
         if (announcement == null) {
-            Log.d(TAG, "skip empty text: " + packageName);
+            logSkip("empty-text", packageName);
             recordSkip(packageName, "没有可读文字");
             return;
         }
         if (!isNewNotification(statusBarNotification, announcement)) {
-            Log.d(TAG, "skip duplicate: " + packageName);
+            logSkip("duplicate", packageName);
             recordSkip(packageName, "内容已播报过");
             return;
         }
