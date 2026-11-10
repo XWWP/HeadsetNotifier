@@ -29,6 +29,31 @@ public class KeepAliveService extends Service {
         return running;
     }
 
+    /**
+     * 监听掉线的自检周期。
+     *
+     * 这个检查必须放在保活服务里而不是监听服务里：监听服务被解绑时它自己已经不在了，
+     * 没有"外部视角"能发现这件事。保活服务在前台、耳机连着时一直活着，正好可以当这个视角。
+     * 60 秒一次只是读一个静态字段，代价可以忽略。
+     */
+    private static final long LISTENER_CHECK_INTERVAL_MS = 60_000L;
+    private final android.os.Handler healthHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable listenerCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (!running) {
+                return;
+            }
+            if (NotificationReaderService.getInstance() == null) {
+                Log.w(TAG, "listener is not bound; self-healing.");
+                NotificationReaderService.recordEvent("自检：监听未绑定，尝试重绑");
+                NotificationReaderService.requestRebindIfNeeded(KeepAliveService.this);
+            }
+            healthHandler.postDelayed(this, LISTENER_CHECK_INTERVAL_MS);
+        }
+    };
+
     static void start(Context context) {
         if (running) {
             return;
@@ -71,6 +96,8 @@ public class KeepAliveService extends Service {
         // 开机或进程被重新拉起后，通知监听服务不一定处于绑定状态，主动请求一次重绑。
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
                 () -> NotificationReaderService.requestRebindIfNeeded(this), 1500L);
+        healthHandler.removeCallbacks(listenerCheck);
+        healthHandler.postDelayed(listenerCheck, LISTENER_CHECK_INTERVAL_MS);
     }
 
     private java.io.File activeFlagFile() {
@@ -125,6 +152,7 @@ public class KeepAliveService extends Service {
             activeFlagFile().delete();
         } catch (RuntimeException ignored) {
         }
+        healthHandler.removeCallbacksAndMessages(null);
         Log.i(TAG, "KeepAliveService destroyed.");
         NotificationReaderService.recordEvent("保活服务已停止");
         try {

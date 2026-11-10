@@ -202,3 +202,44 @@ docs/
 - 心跳文件 mtime 11:59 → 12:03 自行刷新 → 空闲心跳在跑
 - 状态页显示"已暂停"，`lastPollTickMs` 为 0
 - **未验证**：接上耳机后 `Polling started` 与 `轮询：运行中` —— 当时无可用耳机
+
+## 监听绑定自愈（2.7.12 / versionCode 29）
+
+### 现场（2026-11-10 20:27）
+
+```
+pid=25372            进程在
+isForeground=true    前台服务在
+耳机端口=2           耳机连着
+cgroup.freeze=0      没被冻
+监听绑定=0           ← 问题在这里
+settings.enabled_notification_listeners 里仍有本应用  ← 授权没丢
+```
+
+即：**授权还在、进程活着、耳机连着，但 NotificationListenerService 没有绑定**，
+而模块只看 `pidof`，看不见这一态；`requestRebind` 发过一次就不再管，
+失败也没有任何回调 —— 于是静默不播报，直到有人手动开一下 App。
+
+### 修法（App 侧，不需要 root）
+
+1. `requestRebindIfNeeded()` 改成带复核的重试链：3s / 10s / 30s 各复核一次，
+   `instance != null` 即停；链只允许存在一条（`rebindChainRunning`），
+   否则 WakeReceiver、KeepAliveService.onCreate、蓝牙广播会在同一秒各起一条链，
+   日志里同一个 attempt 会重复三次。
+2. `KeepAliveService` 加 60 秒自检：`NotificationListenerService` 被解绑时它自己已经
+   不在了，没有"外部视角"能发现；保活服务在前台、耳机连着时一直活着，正好当这个视角。
+   发现 `getInstance() == null` 就重绑。
+
+### 实测
+
+- 装包后监听必然掉（`pm install -r` 会解绑）→ 广播唤醒 → **9 秒内自动绑回**，
+  全程无需 `cmd notification allow_listener`
+- 单链验证：`attempt 1 → 3s → attempt 2 → onListenerConnected`，无重复
+- 60 秒自检验证：`disallow_listener` 后第 37 秒该检查触发，按 3/10/30 秒重试；
+  权限被真正撤掉时只能等人重新授权，这一点代码里用 `recordEvent` 留了痕
+
+### 仍未覆盖
+
+- **不带耳机时**保活服务是停的，60 秒自检也随之停。此时监听掉线要靠模块广播拉起
+  （`WakeReceiver`）才会重试；无 root 设备没有这一环。
+- 模块侧仍只检查 `pidof`，没有 `dumpsys notification` 复核（P0-1 的模块半边没做）。

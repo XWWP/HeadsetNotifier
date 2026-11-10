@@ -425,15 +425,59 @@ public class NotificationReaderService extends NotificationListenerService {
         }
     };
 
+    /**
+     * requestRebind 是"请求"，不是"保证"：系统可能因为解绑中的竞态、进程刚重启、
+     * 或者 binder 侧状态不一致而直接忽略它，且没有任何回调告诉我们失败了。
+     * 之前的实现发一次就结束，于是出现"权限还在、服务没绑、界面显示正常，
+     * 但一条都不播报"的状态，只能等人手动开一下 App。这里补上复核与退避重试。
+     */
+    private static final long[] REBIND_RETRY_DELAYS_MS = {3_000L, 10_000L, 30_000L};
+    /**
+     * 重试链只允许存在一条。
+     * WakeReceiver、KeepAliveService.onCreate、蓝牙广播几乎会在同一秒内各自调一次
+     * requestRebindIfNeeded，不去重的话就是三条链并行发 requestRebind，
+     * 日志里会看到同一个 attempt 重复三次。
+     */
+    private static volatile boolean rebindChainRunning;
+
     static void requestRebindIfNeeded(Context context) {
+        if (rebindChainRunning) {
+            return;
+        }
+        rebindChainRunning = true;
+        rebindAttempt(context.getApplicationContext(), 0);
+    }
+
+    private static void rebindAttempt(Context context, int attempt) {
+        if (instance != null) {
+            // 已经绑上了（可能是上一次请求生效了），不用再折腾
+            rebindChainRunning = false;
+            return;
+        }
         try {
             android.content.ComponentName component =
                     new android.content.ComponentName(context, NotificationReaderService.class);
             NotificationListenerService.requestRebind(component);
-            Log.i(TAG, "requestRebind issued.");
+            Log.i(TAG, "requestRebind issued (attempt " + (attempt + 1) + ").");
         } catch (RuntimeException exception) {
             Log.w(TAG, "requestRebind failed", exception);
         }
+        if (attempt >= REBIND_RETRY_DELAYS_MS.length) {
+            recordEvent("监听重绑多次未生效，可能需要手动重新授权");
+            rebindChainRunning = false;
+            return;
+        }
+        final Context appContext = context;
+        final int next = attempt + 1;
+        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                () -> {
+                    if (instance == null) {
+                        Log.w(TAG, "listener still unbound after " + REBIND_RETRY_DELAYS_MS[attempt]
+                                + "ms, retrying.");
+                        rebindAttempt(appContext, next);
+                    }
+                },
+                REBIND_RETRY_DELAYS_MS[attempt]);
     }
 
     @Override
@@ -459,6 +503,7 @@ public class NotificationReaderService extends NotificationListenerService {
     public void onListenerConnected() {
         super.onListenerConnected();
         Log.i(TAG, "onListenerConnected: listener is bound and ready.");
+        rebindChainRunning = false;
         recordEvent("监听已连接");
         ensureKeepAliveIfNeeded();
         // 重新绑定后按当前条件恢复轮询，避免被系统解绑再绑定时轮询已停。
