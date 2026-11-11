@@ -51,17 +51,23 @@ jobs:
         run: |
           mkdir -p "$HOME/.android"
           if [ -n "$KEY_B64" ]; then
-            printf '%s' "$KEY_B64" | base64 -d > "$HOME/.android/debug.keystore"
-            echo "使用仓库 secret 中的密钥"
+            printf '%s' "$KEY_B64" | base64 -d > "$HOME/.android/debug.keystore" 2>/dev/null || true
+            if [ -s "$HOME/.android/debug.keystore" ] && \
+               keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android >/dev/null 2>&1; then
+              echo "secret" > /tmp/ks-source.txt
+              echo "使用仓库 secret 中的密钥（长度 ${#KEY_B64}）"
+            else
+              echo "secret-invalid" > /tmp/ks-source.txt
+              echo "::warning::DEBUG_KEYSTORE_B64 存在但无法解码或不是有效 keystore（长度 ${#KEY_B64}）"
+            fi
           elif [ -f ci/debug.keystore ]; then
             cp ci/debug.keystore "$HOME/.android/debug.keystore"
+            echo "repo" > /tmp/ks-source.txt
             echo "使用仓库内 ci/debug.keystore"
           else
-            echo "未提供密钥，使用临时生成的 debug keystore（此包无法覆盖安装到本机）"
-            exit 0
+            echo "none" > /tmp/ks-source.txt
+            echo "::warning::未提供密钥，使用临时生成的 debug keystore（此包无法覆盖安装到本机）"
           fi
-          keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android >/dev/null \
-            && echo "keystore 可读，签名将与本地一致"
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --no-daemon --stacktrace
@@ -70,6 +76,15 @@ jobs:
         run: |
           ls -l app/build/outputs/apk/debug/
           sha256sum app/build/outputs/apk/debug/*.apk | tee apk.sha256
+          # 把签名证书指纹落成文件：Actions 日志在手机上翻不到，这样可以塞进 ci-status
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | head -1)
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk 2>/dev/null \
+              | grep -i "certificate SHA-256" | head -1 | sed 's/.*digest: //' > signer.txt || true
+          fi
+          echo "keystore_source=$(cat /tmp/ks-source.txt 2>/dev/null || echo unknown)" > /tmp/sig.txt
+          echo "signer_sha256=$(cat signer.txt 2>/dev/null || echo unknown)" >> /tmp/sig.txt
+          cat /tmp/sig.txt
 
       # root 保活模块：保持 module.prop 在 zip 根目录，管理器才能识别
       - name: Package keep-alive module
@@ -133,6 +148,7 @@ jobs:
             if [ -f apk.sha256 ]; then
               echo "apk_sha256=$(cut -d' ' -f1 apk.sha256)"
             fi
+            cat /tmp/sig.txt 2>/dev/null
           } > /tmp/ci-status.txt
           BLOB=$(git hash-object -w /tmp/ci-status.txt)
           TREE=$(printf '100644 blob %s\tci-status.txt\n' "$BLOB" | git mktree)
