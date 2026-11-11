@@ -44,7 +44,35 @@ git fetch origin ci-status
 git show origin/ci-status:ci-status.txt
 ```
 
-## 签名（重要）
+## 签名（已解决，2026-11-11 验证通过）
+
+做法与踩过的坑：
+
+1. runner 上的默认 debug 密钥不可信 —— 把 keystore 放到 `$HOME/.android/debug.keystore`
+   之后，AGP 仍然用了另一个临时密钥（每轮产物证书指纹都不同）。
+2. 因此改为**显式 signingConfig**：`app/build.gradle.kts` 读环境变量
+   `AIRANNOUNCE_DEBUG_KEYSTORE`，有值就用它签 debug 包；本地构建不设该变量，行为不变。
+3. keystore 来自仓库 secret。这个仓库里它实际叫 `XWWP`（建的时候自动填充成用户名），
+   工作流同时接受 `DEBUG_KEYSTORE_B64` 和 `XWWP` 两个名字。
+4. 构建完成后把证书指纹写进 `ci-status`，手机端不用看 Actions 日志就能判断签名对不对。
+
+实测结果：
+
+```
+keystore_source=secret:XWWP
+signer_sha256=0e3413715d6e16863cb83ba51333532f140914cf7ebc90c7496251f6cc1c0047
+```
+
+与本机包完全一致，且直接把 CI 产物 `pm install -r` 装进真机成功（2.7.12）。
+
+### 历史对比（未修好前）
+
+```
+CI 包     cb6171de... / a34a594a... / 1c0b9400...  每轮都不同 → 临时密钥
+本机包    0e341371...
+```
+
+## 签名（旧说明，保留作参考）
 
 AGP 的默认 debug 签名读 `$HOME/.android/debug.keystore`。CI runner 是干净的，
 不提供密钥时会临时生成一个，**签名与本地包不同**，`pm install -r` 会报
