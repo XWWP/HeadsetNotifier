@@ -47,8 +47,12 @@ public class KeepAliveService extends Service {
             }
             if (NotificationReaderService.getInstance() == null) {
                 Log.w(TAG, "listener is not bound; self-healing.");
-                NotificationReaderService.recordEvent("自检：监听未绑定，尝试重绑");
-                NotificationReaderService.requestRebindIfNeeded(KeepAliveService.this);
+                // 优先走 Shizuku 的 disallow/allow 切换：requestRebind 在部分 ROM 上是空操作，
+                // 而切换是实测唯一稳定有效的手段。没有可用 Shizuku 时才退回 requestRebind。
+                if (!ShizukuChannel.healListenerAsync(KeepAliveService.this)) {
+                    NotificationReaderService.recordEvent("自检：监听未绑定，尝试重绑");
+                    NotificationReaderService.requestRebindIfNeeded(KeepAliveService.this);
+                }
             }
             healthHandler.postDelayed(this, LISTENER_CHECK_INTERVAL_MS);
         }

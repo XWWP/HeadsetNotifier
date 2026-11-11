@@ -1068,7 +1068,8 @@ public class MainActivity extends Activity {
         body.addView(createSectionTitle("Shizuku 通道（可选，无 Root 时用）"));
         TextView shizukuDesc = new TextView(this);
         shizukuDesc.setText("借 Shizuku 的 shell 权限补做三件事：重绑监听、standby 拉 active、"
-                + "加入电池白名单。无法解冻被冻结的进程，仅作无 Root 设备的兜底。");
+                + "加入电池白名单；监听掉线时每分钟自动用 Shizuku 切换一次绑定（比应用自身的\n"
+                + "重绑请求可靠）。无法解冻被冻结的进程，仅作无 Root 设备的兜底。");
         shizukuDesc.setTextSize(12.5f);
         shizukuDesc.setTextColor(TEXT_SECONDARY);
         shizukuDesc.setLineSpacing(dp(3), 1.0f);

@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.InputStream;
@@ -198,6 +199,63 @@ public final class ShizukuChannel {
                 Log.w(TAG, "Shizuku quiet apply failed", throwable);
             }
         }, "shizuku-quiet-apply").start();
+    }
+
+    /** 监听修复的失败计数与冷却：连续失败就停手，别对着无解状态每分钟刷一次。 */
+    private static int healFailStreak;
+    private static volatile long healBlockedUntilMs;
+
+    /**
+     * 用 Shizuku 的 shell 权限修掉「权限在、但监听没绑上」这一态。
+     *
+     * 为什么不用 requestRebind：这台 ROM 上它基本是空操作（2026-11-11 实测 3/3 失败），
+     * 而 `cmd notification disallow_listener` → 等 1 秒 → `allow_listener`
+     * 切一次 3/3 成功。切换是唯一稳定有效的手段。
+     *
+     * 前置条件：通知使用权本来就在。用户主动撤权时一律不动手，别替他改回去。
+     * 两条命令之间要 sleep，不能占住主线程，所以这里起线程并立刻返回"是否已接管"。
+     */
+    static boolean healListenerAsync(Context context) {
+        if (SystemClock.elapsedRealtime() < healBlockedUntilMs) {
+            return false;
+        }
+        if (!MainActivity.hasNotificationAccess(context)) {
+            return false;
+        }
+        if (state(context) != State.READY) {
+            return false;
+        }
+        final Context appContext = context.getApplicationContext();
+        new Thread(() -> {
+            boolean ok = false;
+            try {
+                IShizukuService service = IShizukuService.Stub.asInterface(Shizuku.getBinder());
+                if (service != null) {
+                    String listener = appContext.getPackageName() + "/"
+                            + NotificationReaderService.class.getName();
+                    StringBuilder report = new StringBuilder();
+                    run(service, "cmd notification disallow_listener " + listener
+                            + " 0; sleep 1; cmd notification allow_listener " + listener + " 0",
+                            report);
+                    ok = report.indexOf("\u2717") < 0;
+                }
+            } catch (Throwable throwable) {
+                Log.w(TAG, "Shizuku listener heal failed", throwable);
+            }
+            if (ok) {
+                healFailStreak = 0;
+                NotificationReaderService.recordEvent("Shizuku：已切换监听绑定");
+            } else {
+                healFailStreak++;
+                Log.w(TAG, "Shizuku listener heal failed, streak=" + healFailStreak);
+                if (healFailStreak >= 3) {
+                    healFailStreak = 0;
+                    healBlockedUntilMs = SystemClock.elapsedRealtime() + 10 * 60_000L;
+                    NotificationReaderService.recordEvent("Shizuku：监听修复连续失败，暂停 10 分钟");
+                }
+            }
+        }, "shizuku-listener-heal").start();
+        return true;
     }
 
     private static boolean run(IShizukuService service, String command, StringBuilder report) {
