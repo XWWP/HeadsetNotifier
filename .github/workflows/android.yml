@@ -55,9 +55,10 @@ jobs:
           ANDROID_DEBUG_KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
           DEBUG_KS_B64: ${{ secrets.DEBUG_KS_B64 }}
           VAR_DEBUG_KEYSTORE_B64: ${{ vars.DEBUG_KEYSTORE_B64 }}
+          XWWP: ${{ secrets.XWWP }}
         run: |
           : > /tmp/probe.txt
-          for n in DEBUG_KEYSTORE_B64 DEBUG_KEYSTORE KEYSTORE_B64 ANDROID_DEBUG_KEYSTORE_B64 DEBUG_KS_B64 VAR_DEBUG_KEYSTORE_B64; do
+          for n in DEBUG_KEYSTORE_B64 DEBUG_KEYSTORE KEYSTORE_B64 ANDROID_DEBUG_KEYSTORE_B64 DEBUG_KS_B64 VAR_DEBUG_KEYSTORE_B64 XWWP; do
             v="${!n}"
             echo "probe_${n}=${#v}" >> /tmp/probe.txt
           done
@@ -68,6 +69,9 @@ jobs:
           KEY_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
           # 兼容误加在 Variables 标签页的情况（Keys 只有 secret 才安全，这里只是兜底）
           KEY_VAR: ${{ vars.DEBUG_KEYSTORE_B64 }}
+          # 实测这个仓库里的 secret 就是被起名叫 XWWP（自动填充成了用户名），
+          # 保留成候选名，免得以后再对不上。
+          KEY_CUSTOM: ${{ secrets.XWWP }}
         run: |
           mkdir -p "$HOME/.android"
           SRC="secret"
@@ -75,6 +79,11 @@ jobs:
             KEY_B64="$KEY_VAR"
             SRC="vars"
             echo "::warning::DEBUG_KEYSTORE_B64 是 Repository variable 而非 secret；能用，但明文可见"
+          fi
+          if [ -z "$KEY_B64" ] && [ -n "$KEY_CUSTOM" ]; then
+            KEY_B64="$KEY_CUSTOM"
+            SRC="secret:XWWP"
+            echo "::notice::使用 secrets.XWWP（建议改名为 DEBUG_KEYSTORE_B64）"
           fi
           if [ -n "$KEY_B64" ]; then
             printf '%s' "$KEY_B64" | base64 -d > "$HOME/.android/debug.keystore" 2>/dev/null || true
