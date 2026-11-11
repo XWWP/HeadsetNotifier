@@ -98,3 +98,14 @@ CI 包     certificate SHA-256: cb6171de3554d08fafac422a07c20f894b951305d7d7aa33
 - CI 构建用 Maven 版 aapt2（x86_64 runner 原生执行），不需要本机那套 QEMU 桥接；
   `gradle.properties` 里没有提交 `aapt2FromMavenOverride`，两边互不影响。
 - `*.apk` 在 `.gitignore` 里，推送走 `commit-tree` 绕开索引，所以工作区不会被产物污染。
+
+## Release
+
+推 `v*` tag 会额外创建一个 Release，附件：`app-debug.apk`、`apk.sha256`、
+`airannounce-thaw-*.zip`（root 模块）。签名密钥与 app-latest 分支一致。
+
+```
+git tag -a v2.8.0 -m "..."; git push origin v2.8.0
+```
+
+CI 约 90 秒完成；`ci-status` 分支里能看到 `status/sha/signer_sha256`。

@@ -289,3 +289,31 @@ if listener_granted && ! listener_bound; then fix_listener; fi
 - 没有 root、也没装 Shizuku 的设备，没有这一层。app 侧只能靠
   `requestRebind`（不可靠）+ 保活服务的 60 秒自检，恢复率不保证。
 - 恢复时间取决于 tick 相位：最坏要等一个 60 秒检查周期。
+
+## Shizuku 通道补齐（2.8.0 / versionCode 30）
+
+模块 v1.7 那套 `disallow → allow` 切换，现在 app 侧也有一份，给无 root 设备用：
+
+- `ShizukuChannel.healListenerAsync()`：先确认「通知使用权在」+「Shizuku READY」，
+  然后在后台线程执行 `cmd notification disallow_listener … 0; sleep 1; cmd notification allow_listener … 0`
+- 连续失败 3 次冷却 10 分钟（`healFailStreak` / `healBlockedUntilMs`）
+- `KeepAliveService` 的 60 秒自检优先调它，返回 false（没装/没跑/没授权）才退回
+  `requestRebind`
+
+### 已验证 / 未验证
+
+- 已验证：Shizuku 通道本身可用。启动 Shizuku（root 方式）→ `pm grant … API_V23`
+  → 重启 app 进程后 `shizuku_last_applied_at` 从 1794408010885 变成 1794408076774，
+  说明 `run()` 里的三条命令在 2.8.0 上确实执行成功（只有全 ✓ 才写这个时间戳）。
+- 未验证：**heal 的触发**。需要一个「权限在、监听未绑」的状态才能触发，
+  试过「冻结进程 + disallow/allow」制造这一态，系统在解冻后自己绑回去了，造不出来。
+  切换命令本身在模块侧已实测 3/3 成功，heal 只是换了执行者。
+
+### 无 root 时的实际保活边界
+
+| 能力 | 有 Shizuku |
+|---|---|
+| 监听掉线自修 | 能（前提：app 进程活着、Shizuku 在跑） |
+| 解冻 cgroup | 不能（shell uid 写不了） |
+| 进程被杀后自动拉起 | 不能（Shizuku 不会替你定时） |
+| 重启后 | 非 root 需要人重新激活 Shizuku |
