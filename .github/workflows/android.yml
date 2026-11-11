@@ -48,14 +48,22 @@ jobs:
       - name: Restore debug keystore
         env:
           KEY_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+          # 兼容误加在 Variables 标签页的情况（Keys 只有 secret 才安全，这里只是兜底）
+          KEY_VAR: ${{ vars.DEBUG_KEYSTORE_B64 }}
         run: |
           mkdir -p "$HOME/.android"
+          SRC="secret"
+          if [ -z "$KEY_B64" ] && [ -n "$KEY_VAR" ]; then
+            KEY_B64="$KEY_VAR"
+            SRC="vars"
+            echo "::warning::DEBUG_KEYSTORE_B64 是 Repository variable 而非 secret；能用，但明文可见"
+          fi
           if [ -n "$KEY_B64" ]; then
             printf '%s' "$KEY_B64" | base64 -d > "$HOME/.android/debug.keystore" 2>/dev/null || true
             if [ -s "$HOME/.android/debug.keystore" ] && \
                keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android >/dev/null 2>&1; then
-              echo "secret" > /tmp/ks-source.txt
-              echo "使用仓库 secret 中的密钥（长度 ${#KEY_B64}）"
+              echo "$SRC" > /tmp/ks-source.txt
+              echo "使用 $SRC 中的密钥（长度 ${#KEY_B64}）"
             else
               echo "secret-invalid" > /tmp/ks-source.txt
               echo "::warning::DEBUG_KEYSTORE_B64 存在但无法解码或不是有效 keystore（长度 ${#KEY_B64}）"
