@@ -64,6 +64,7 @@ sleep 10
 
 MODE=low
 TICK_HIGH=0
+LISTENER_FAIL=0
 TICK_IDLE=0
 TICK_BT=0
 THAW_COUNT=0
@@ -119,6 +120,41 @@ bt_audio_active() {
     *) return 1 ;;
     esac
     dumpsys bluetooth_manager 2>/dev/null | grep -A4 -E 'A2DP:|LE_AUDIO:' | grep -qi 'ACTIVE'
+}
+
+# ---------------- 监听绑定自愈 ----------------
+# 这台 ROM 上 NotificationListenerService.requestRebind() 经常是空操作：
+# app 确实发了重绑请求，系统不理，表现为"进程在、前台服务在、耳机连着、
+# 通知使用权也还在，但一条都不播"。2026-11-11 复现 3 次 requestRebind 全失败，
+# 而 disallow -> allow 切一次 3/3 全部成功。
+#
+# 注意：自动调用 allow_listener 等于替用户授权，所以必须先确认权限本来就在；
+# 用户主动撤权时绝不能替他改回去。
+listener_granted() {
+    settings get secure enabled_notification_listeners 2>/dev/null \
+        | tr ':' '\n' | grep -q "com.sakura.airannounce"
+}
+
+listener_bound() {
+    dumpsys notification 2>/dev/null \
+        | sed -n '/Live notification listeners/,/Snoozed/p' \
+        | grep -q "com.sakura.airannounce"
+}
+
+fix_listener() {
+    LC="$PKG/com.sakura.airannounce.NotificationReaderService"
+    log "监听未绑定（权限仍在），执行 disallow/allow 切换"
+    cmd notification disallow_listener "$LC" 0 >/dev/null 2>&1
+    sleep 1
+    cmd notification allow_listener "$LC" 0 >/dev/null 2>&1
+    sleep 2
+    if listener_bound; then
+        log "监听已重新绑定"
+        LISTENER_FAIL=0
+    else
+        LISTENER_FAIL=$((LISTENER_FAIL + 1))
+        log "监听重绑失败（$LISTENER_FAIL/3）"
+    fi
 }
 
 # 冻结文件路径：先按 /proc/<pid>/cgroup 推算（cgroup v2 布局），
@@ -269,6 +305,12 @@ while true; do
                         continue
                     fi
                     log "前台服务复查失败（$FG_FAIL/3）"
+                fi
+            fi
+            # 每分钟一次监听健康检查：权限在、服务却没绑上——模块以前完全看不见这一态
+            if [ $((TICK_HIGH % 12)) -eq 0 ] && [ "$LISTENER_FAIL" -lt 3 ]; then
+                if listener_granted && ! listener_bound; then
+                    fix_listener
                 fi
             fi
             if [ $((TICK_HIGH % 120)) -eq 0 ]; then

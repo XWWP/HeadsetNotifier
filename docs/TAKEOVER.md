@@ -243,3 +243,49 @@ settings.enabled_notification_listeners 里仍有本应用  ← 授权没丢
 - **不带耳机时**保活服务是停的，60 秒自检也随之停。此时监听掉线要靠模块广播拉起
   （`WakeReceiver`）才会重试；无 root 设备没有这一环。
 - 模块侧仍只检查 `pidof`，没有 `dumpsys notification` 复核（P0-1 的模块半边没做）。
+
+## 监听自愈：模块侧（模块 v1.7 / versionCode 8）
+
+### 为什么 app 侧不够
+
+`NotificationListenerService.requestRebind()` 在这台 ROM 上经常是**空操作**：
+app 确实发了请求，系统不理，日志里只会反复出现
+`listener still unbound after 3000ms, retrying.`，退避到第 4 次后放弃。
+
+2026-11-11 复现 3 次，全部失败；而手工 `disallow_listener` → `allow_listener`
+切一次，3/3 全部成功。所以真正有效的手段是"切换"，不是"请求重绑"。
+
+### 模块怎么做的
+
+`keepalive/service.sh` 的 high 模式里，每 12 个 tick（约 60 秒）：
+
+```sh
+if listener_granted && ! listener_bound; then fix_listener; fi
+```
+
+- `listener_granted`：`settings get secure enabled_notification_listeners` 里有本应用
+- `listener_bound`：`dumpsys notification` 的 `Live notification listeners` 段里有本应用
+- `fix_listener`：`disallow_listener` → sleep 1 → `allow_listener` → sleep 2 → 复核
+- 连续失败 3 次就停手（`LISTENER_FAIL`），避免对着无解的状态死循环
+
+**安全边界**：只有"权限本来就在、只是没绑上"才动手。用户主动撤权时
+`listener_granted` 为假，模块绝不替他改回去。
+
+### 实测（强杀 → 自动恢复）
+
+```
+11:09:09  am force-stop com.sakura.airannounce      （我自己触发）
+11:09:14  应用进程已不在，退回低频待机
+11:09:58  拉起成功 pid=20387
+11:10:18  应用要求保护，进入高频解冻
+11:11:14  监听未绑定（权限仍在），执行 disallow/allow 切换
+11:11:17  监听已重新绑定
+```
+
+从强杀到恢复约 **2 分 8 秒**，全程无人干预。
+
+### 仍存在的边界
+
+- 没有 root、也没装 Shizuku 的设备，没有这一层。app 侧只能靠
+  `requestRebind`（不可靠）+ 保活服务的 60 秒自检，恢复率不保证。
+- 恢复时间取决于 tick 相位：最坏要等一个 60 秒检查周期。
