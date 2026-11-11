@@ -45,6 +45,24 @@ jobs:
       # 把同一个密钥放回去，CI 包才能直接覆盖安装到手机上；否则每次 CI 都生成新密钥，
       # 装的时候报 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
       # 优先 secret，其次仓库内 ci/debug.keystore，都没有则用临时密钥（签名与本地包不一致）。
+      # Actions 不允许列出仓库里有哪些 secret，这里只能按可能的命名逐个探长度（不打印内容），
+      # 结果写进 ci-status，省得在手机上翻日志。
+      - name: Probe secret names
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+          DEBUG_KEYSTORE: ${{ secrets.DEBUG_KEYSTORE }}
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          ANDROID_DEBUG_KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
+          DEBUG_KS_B64: ${{ secrets.DEBUG_KS_B64 }}
+          VAR_DEBUG_KEYSTORE_B64: ${{ vars.DEBUG_KEYSTORE_B64 }}
+        run: |
+          : > /tmp/probe.txt
+          for n in DEBUG_KEYSTORE_B64 DEBUG_KEYSTORE KEYSTORE_B64 ANDROID_DEBUG_KEYSTORE_B64 DEBUG_KS_B64 VAR_DEBUG_KEYSTORE_B64; do
+            v="${!n}"
+            echo "probe_${n}=${#v}" >> /tmp/probe.txt
+          done
+          cat /tmp/probe.txt
+
       - name: Restore debug keystore
         env:
           KEY_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
@@ -157,6 +175,7 @@ jobs:
               echo "apk_sha256=$(cut -d' ' -f1 apk.sha256)"
             fi
             cat /tmp/sig.txt 2>/dev/null
+            cat /tmp/probe.txt 2>/dev/null
           } > /tmp/ci-status.txt
           BLOB=$(git hash-object -w /tmp/ci-status.txt)
           TREE=$(printf '100644 blob %s\tci-status.txt\n' "$BLOB" | git mktree)
