@@ -1,14 +1,22 @@
 name: Build APK
 
-# 推 tag（v*）时构建 debug APK 并挂到 Release；也可以在 Actions 页手动触发
+# 触发：
+#   - 推到 main：自动构建，产物推到 apk-latest 分支（手机端能 git fetch 拿到）
+#   - 推 tag（v*）：另外挂一个 Release
+#   - 手动：Actions 页 Run workflow
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# 同一分支连续推送时取消上一轮，避免几轮构建互相覆盖产物
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -32,6 +40,28 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-35 build-tools;35.0.0'
+
+      # 签名一致性：AGP 的默认 debug 签名读 $HOME/.android/debug.keystore。
+      # 把同一个密钥放回去，CI 包才能直接覆盖安装到手机上；否则每次 CI 都生成新密钥，
+      # 装的时候报 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
+      # 优先 secret，其次仓库内 ci/debug.keystore，都没有则用临时密钥（签名与本地包不一致）。
+      - name: Restore debug keystore
+        env:
+          KEY_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          mkdir -p "$HOME/.android"
+          if [ -n "$KEY_B64" ]; then
+            printf '%s' "$KEY_B64" | base64 -d > "$HOME/.android/debug.keystore"
+            echo "使用仓库 secret 中的密钥"
+          elif [ -f ci/debug.keystore ]; then
+            cp ci/debug.keystore "$HOME/.android/debug.keystore"
+            echo "使用仓库内 ci/debug.keystore"
+          else
+            echo "未提供密钥，使用临时生成的 debug keystore（此包无法覆盖安装到本机）"
+            exit 0
+          fi
+          keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android >/dev/null \
+            && echo "keystore 可读，签名将与本地一致"
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --no-daemon --stacktrace
@@ -59,10 +89,34 @@ jobs:
             apk.sha256
             airannounce-thaw-*.zip
 
-      # 把本次构建的结果写进 ci-status 分支：没有 token 的环境（比如本机）也能
-      # 用 git 协议直接看到 CI 成没成功，不必去 Actions 页面翻日志。
-      # 注意：Commit 用 commit-tree 构造，不碰工作区；push 复用 checkout 配好的
-      # 凭证（run 步骤里默认没有 GITHUB_TOKEN，写 ${GITHUB_TOKEN} 会挂起等输入）
+      # 把产物推到 apk-latest 分支：这台手机打不开 https，Release 页面下载不了，
+      # 但 ssh.github.com:443 通，所以走 git 通道投递二进制。
+      # 每次 force-push 单条提交，分支历史不增长。
+      # commit-tree 构造提交，绕开 .gitignore（*.apk 被忽略），也不碰工作区。
+      - name: Publish APK to apk-latest branch
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          cp app/build/outputs/apk/debug/app-debug.apk ./airannounce-debug.apk
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF_NAME}"
+            echo "version_name=$(sed -n 's/.*versionName = "\(.*\)"/\1/p' app/build.gradle.kts)"
+            echo "version_code=$(sed -n 's/.*versionCode = \([0-9]*\)/\1/p' app/build.gradle.kts)"
+            echo "built_at=$(date -u +%FT%TZ)"
+            echo "apk_sha256=$(cut -d' ' -f1 apk.sha256)"
+          } > build-info.txt
+          APK_BLOB=$(git hash-object -w airannounce-debug.apk)
+          SHA_BLOB=$(git hash-object -w apk.sha256)
+          INFO_BLOB=$(git hash-object -w build-info.txt)
+          TREE=$(printf '100644 blob %s\tairannounce-debug.apk\n100644 blob %s\tapk.sha256\n100644 blob %s\tbuild-info.txt\n' \
+                 "$APK_BLOB" "$SHA_BLOB" "$INFO_BLOB" | git mktree)
+          COMMIT=$(git commit-tree "$TREE" -m "apk ${GITHUB_SHA::7}")
+          git push -f origin "$COMMIT:refs/heads/apk-latest"
+
+      # 把构建结果写进 ci-status 分支：没有 token 的环境（比如本机）也能用 git 协议
+      # 直接看到 CI 成没成功，不必去 Actions 页翻日志。
       - name: Report build status
         if: always()
         env:
@@ -99,7 +153,7 @@ jobs:
 
             另附 root 保活模块 `airannounce-thaw-*.zip`（Magisk / KernelSU / APatch，可选）。
 
-            注意：CI 用临时生成的 debug keystore 签名，和本机自建的 debug 包签名不同，
-            覆盖安装会提示签名不一致，需要先卸载旧包。
+            签名：若仓库配置了 `DEBUG_KEYSTORE_B64` secret，此包与本机自建包同签名，
+            可直接 `pm install -r` 覆盖；否则为临时密钥，覆盖安装会报签名不一致，需先卸载。
 
             校验：见附带的 apk.sha256。
