@@ -103,9 +103,25 @@ jobs:
             echo "none" > /tmp/ks-source.txt
             echo "::warning::未提供密钥，使用临时生成的 debug keystore（此包无法覆盖安装到本机）"
           fi
+          # 单独放一份到工作区外面，供 AIRANNOUNCE_DEBUG_KEYSTORE 显式引用
+          if [ -s "$HOME/.android/debug.keystore" ] && \
+             keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android >/dev/null 2>&1; then
+            cp "$HOME/.android/debug.keystore" "$GITHUB_WORKSPACE/../.android-key"
+            echo "已导出到 $GITHUB_WORKSPACE/../.android-key"
+          fi
 
       - name: Build debug APK
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        env:
+          # 显式告诉 Gradle 用哪个 keystore，绕开 AGP 对默认路径的处理
+          AIRANNOUNCE_DEBUG_KEYSTORE: ${{ github.workspace }}/../.android-key
+        run: |
+          if [ -s "$AIRANNOUNCE_DEBUG_KEYSTORE" ]; then
+            echo "使用显式 keystore: $AIRANNOUNCE_DEBUG_KEYSTORE"
+          else
+            echo "没有可用 keystore，回退默认签名"
+            unset AIRANNOUNCE_DEBUG_KEYSTORE
+          fi
+          gradle :app:assembleDebug --no-daemon --stacktrace
 
       - name: Show artifact info
         run: |

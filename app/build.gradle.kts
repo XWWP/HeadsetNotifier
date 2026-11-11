@@ -2,6 +2,12 @@ plugins {
     id("com.android.application")
 }
 
+// CI 用：环境变量指定 keystore 就显式走这个签名配置。
+// 不能只依赖 AGP 的"默认 debug keystore"——实测把文件放到 $HOME/.android/debug.keystore
+// 之后，CI 产物仍被另一个临时密钥签名（每轮指纹都不同），行为不可控。
+// 本地构建不设这个变量，签名方式保持原样。
+val explicitKeystore = System.getenv("AIRANNOUNCE_DEBUG_KEYSTORE")
+
 android {
     namespace = "com.sakura.airannounce"
     compileSdk = 35
@@ -12,6 +18,25 @@ android {
         targetSdk = 34
         versionCode = 29
         versionName = "2.7.12"
+    }
+
+    signingConfigs {
+        if (explicitKeystore != null) {
+            create("explicitDebug") {
+                storeFile = file(explicitKeystore)
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("debug") {
+            if (explicitKeystore != null) {
+                signingConfig = signingConfigs.getByName("explicitDebug")
+            }
+        }
     }
 }
 
