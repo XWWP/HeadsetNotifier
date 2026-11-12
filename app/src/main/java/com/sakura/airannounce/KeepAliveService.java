@@ -37,6 +37,16 @@ public class KeepAliveService extends Service {
      * 60 秒一次只是读一个静态字段，代价可以忽略。
      */
     private static final long LISTENER_CHECK_INTERVAL_MS = 60_000L;
+    /**
+     * 监听连续断多久就发提醒。
+     * 2026-11-12 现场：监听掉了 23 分钟，用户在诊断页才看出来 —— 这种"静默哑火"
+     * 对使用者来说最难查，至少要先喊一声。10 分钟是权衡：够长，自动修复
+     * （模块 60 秒一轮 + 重试）基本都已经失败；够短，不至于一天没人管。
+     */
+    private static final int ALERT_AFTER_TICKS = 10;
+    private static final String ALERT_CHANNEL_ID = "airannounce_listener_alert";
+    private static final int ALERT_NOTIFICATION_ID = 1002;
+    private int unboundTicks;
     private final android.os.Handler healthHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
     private final Runnable listenerCheck = new Runnable() {
@@ -46,6 +56,10 @@ public class KeepAliveService extends Service {
                 return;
             }
             if (NotificationReaderService.getInstance() == null) {
+                unboundTicks++;
+                if (unboundTicks == ALERT_AFTER_TICKS) {
+                    notifyListenerDown();
+                }
                 Log.w(TAG, "listener is not bound; self-healing.");
                 // 优先走 Shizuku 的 disallow/allow 切换：requestRebind 在部分 ROM 上是空操作，
                 // 而切换是实测唯一稳定有效的手段。没有可用 Shizuku 时才退回 requestRebind。
@@ -53,6 +67,9 @@ public class KeepAliveService extends Service {
                     NotificationReaderService.recordEvent("自检：监听未绑定，尝试重绑");
                     NotificationReaderService.requestRebindIfNeeded(KeepAliveService.this);
                 }
+            } else if (unboundTicks > 0) {
+                unboundTicks = 0;
+                cancelListenerAlert();
             }
             healthHandler.postDelayed(this, LISTENER_CHECK_INTERVAL_MS);
         }
@@ -157,6 +174,7 @@ public class KeepAliveService extends Service {
         } catch (RuntimeException ignored) {
         }
         healthHandler.removeCallbacksAndMessages(null);
+        cancelListenerAlert();
         Log.i(TAG, "KeepAliveService destroyed.");
         NotificationReaderService.recordEvent("保活服务已停止");
         try {
@@ -170,6 +188,65 @@ public class KeepAliveService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    /**
+     * 监听长时间没绑上时喊一声，并直接跳到通知使用权设置页。
+     *
+     * 这条路不依赖 root 也不依赖 Shizuku，是"自动修复全失败"之后的最后兜底：
+     * 至少让用户知道现在念不出来，而不是等到某天发现一整天都没声。
+     */
+    private void notifyListenerDown() {
+        NotificationReaderService.recordEvent("提醒：监听已断开超过 "
+                + (ALERT_AFTER_TICKS * LISTENER_CHECK_INTERVAL_MS / 60_000L) + " 分钟");
+        try {
+            NotificationManager manager =
+                    (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (manager == null) {
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationChannel channel = new NotificationChannel(
+                        ALERT_CHANNEL_ID,
+                        "监听掉线提醒",
+                        NotificationManager.IMPORTANCE_HIGH);
+                channel.setDescription("通知监听断开后提醒你手动修复");
+                manager.createNotificationChannel(channel);
+            }
+            android.content.Intent settings = new android.content.Intent(
+                    android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS);
+            settings.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            android.app.PendingIntent pending = android.app.PendingIntent.getActivity(
+                    this, 0, settings,
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                            | android.app.PendingIntent.FLAG_IMMUTABLE);
+            Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                    ? new Notification.Builder(this, ALERT_CHANNEL_ID)
+                    : new Notification.Builder(this);
+            builder.setContentTitle("耳机播报暂时失效")
+                    .setContentText("通知监听没有连上，点这里重新授权")
+                    .setStyle(new Notification.BigTextStyle().bigText(
+                            "通知监听没有连上，所以耳机里不会有播报。\n"
+                                    + "点这条通知进入「通知使用权」，把「耳机通知播报」关一次再开一次即可。"))
+                    .setSmallIcon(android.R.drawable.stat_notify_error)
+                    .setContentIntent(pending)
+                    .setAutoCancel(true)
+                    .setOnlyAlertOnce(true);
+            manager.notify(ALERT_NOTIFICATION_ID, builder.build());
+        } catch (RuntimeException exception) {
+            Log.w(TAG, "posting listener-down alert failed", exception);
+        }
+    }
+
+    private void cancelListenerAlert() {
+        try {
+            NotificationManager manager =
+                    (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (manager != null) {
+                manager.cancel(ALERT_NOTIFICATION_ID);
+            }
+        } catch (RuntimeException ignored) {
+        }
     }
 
     private void createNotificationChannel() {
