@@ -1,0 +1,6 @@
+commit=b50b0448a15220b01d8ca88dd0575b22654a15ca
+ref=main
+version_name=2.8.1
+version_code=31
+built_at=2026-11-12T11:14:24Z
+apk_sha256=28ed7955d94523f1d2939c41c200aef025b061f1ddd37230b8e34e88e1ca385f
