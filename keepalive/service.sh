@@ -65,6 +65,7 @@ sleep 10
 MODE=low
 TICK_HIGH=0
 LISTENER_FAIL=0
+LISTENER_SKIP=0
 TICK_IDLE=0
 TICK_BT=0
 THAW_COUNT=0
@@ -147,13 +148,27 @@ fix_listener() {
     cmd notification disallow_listener "$LC" 0 >/dev/null 2>&1
     sleep 1
     cmd notification allow_listener "$LC" 0 >/dev/null 2>&1
-    sleep 2
+    sleep 3
+    if ! listener_bound; then
+        # 2026-11-12 现场：切换本身没问题，但进程刚被解冻/刚重启时，绑定要几秒才生效，
+        # 只在 2 秒后就判定失败会误判。这里先叫醒进程，再给一次机会。
+        wake_app
+        sleep 3
+    fi
     if listener_bound; then
         log "监听已重新绑定"
         LISTENER_FAIL=0
+        LISTENER_SKIP=0
     else
         LISTENER_FAIL=$((LISTENER_FAIL + 1))
         log "监听重绑失败（$LISTENER_FAIL/3）"
+        if [ "$LISTENER_FAIL" -ge 3 ]; then
+            # 以前这里直接停手，且计数不会自己归零——一旦达到 3 次就再也不修，
+            # 2026-11-12 因此出现了 23 分钟的哑火。改成冷却 10 分钟后重来。
+            LISTENER_FAIL=0
+            LISTENER_SKIP=120
+            log "监听修复连续失败，10 分钟内不再尝试"
+        fi
     fi
 }
 
@@ -308,7 +323,9 @@ while true; do
                 fi
             fi
             # 每分钟一次监听健康检查：权限在、服务却没绑上——模块以前完全看不见这一态
-            if [ $((TICK_HIGH % 12)) -eq 0 ] && [ "$LISTENER_FAIL" -lt 3 ]; then
+            if [ "$LISTENER_SKIP" -gt 0 ]; then
+                LISTENER_SKIP=$((LISTENER_SKIP - 1))
+            elif [ $((TICK_HIGH % 12)) -eq 0 ]; then
                 if listener_granted && ! listener_bound; then
                     fix_listener
                 fi
