@@ -333,7 +333,7 @@ while true; do
             # 每分钟一次监听健康检查：权限在、服务却没绑上——模块以前完全看不见这一态
             if [ "$LISTENER_SKIP" -gt 0 ]; then
                 LISTENER_SKIP=$((LISTENER_SKIP - 1))
-            elif [ $((TICK_HIGH % 12)) -eq 0 ]; then
+            elif [ $((TICK_HIGH % 12)) -eq 0 ] || [ "$TICK_HIGH" -eq 1 ]; then
                 if listener_granted && ! listener_bound; then
                     fix_listener
                 fi
@@ -370,7 +370,7 @@ while true; do
             # 每 3 个 tick（约 60 秒）查一次，和 high 模式共用同一套计数与冷却。
             if [ "$LISTENER_SKIP" -gt 0 ]; then
                 LISTENER_SKIP=$((LISTENER_SKIP - 1))
-            elif [ $((TICK_IDLE % 3)) -eq 0 ] && [ "$TICK_IDLE" -gt 0 ]; then
+            elif [ $((TICK_IDLE % 3)) -eq 0 ]; then
                 if listener_granted && ! listener_bound; then
                     fix_listener
                 fi
