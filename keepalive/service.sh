@@ -221,9 +221,17 @@ thaw() {
 # 拒（实测 ColorOS 的 OplusHansManager 返回 "Not found"）。
 # 也不再用 am start-activity：会切前台并点亮屏幕，打扰用户（v1.5 的做法）。
 wake_app() {
-    [ -n "$(app_pid)" ] && return 0
+    # 以前"进程在就不再广播"，于是出现第三种死锁：
+    #   进程活着，但前台服务没起来（重启后常见），没有 files/active
+    #   → 模块停在 low；又不广播 → 没人叫 syncKeepAlive → 前台服务永远起不来。
+    # 现在：进程在但标记缺失时也要广播，只是把间隔从 60 秒放到 5 分钟，避免频繁打扰。
     NOW=$(date +%s)
-    [ $((NOW - LAST_WAKE)) -ge 60 ] || return 0
+    LIMIT=60
+    if [ -n "$(app_pid)" ]; then
+        [ -f "$FLAG" ] && return 0
+        LIMIT=300
+    fi
+    [ $((NOW - LAST_WAKE)) -ge $LIMIT ] || return 0
     LAST_WAKE=$NOW
     WAKE_OUT=$(am broadcast --user 0 --include-stopped-packages \
         -a "$PKG.WAKE" -n "$PKG/.WakeReceiver" 2>&1)
@@ -355,6 +363,18 @@ while true; do
         if bt_audio_active; then
             thaw
             wake_app
+            # 低频模式也要查监听：这里曾经是个死锁——
+            #   监听没绑 → NotificationReaderService 不创建 → app 不起前台服务
+            #   → 没有 files/active → 模块停在 low → 而监听修复只写在 high 分支里
+            #   → 永远没人修，直到用户手动去通知使用权里关一次再开一次。
+            # 每 3 个 tick（约 60 秒）查一次，和 high 模式共用同一套计数与冷却。
+            if [ "$LISTENER_SKIP" -gt 0 ]; then
+                LISTENER_SKIP=$((LISTENER_SKIP - 1))
+            elif [ $((TICK_IDLE % 3)) -eq 0 ] && [ "$TICK_IDLE" -gt 0 ]; then
+                if listener_granted && ! listener_bound; then
+                    fix_listener
+                fi
+            fi
             # 耳机判定成功但没标记时，以前完全静默：日志只有"模式=low"，
             # 分不清"没认出耳机"和"认出了但没有要拉起的对象"，排查时会误判成前者。
             TICK_BT=$((TICK_BT + 1))
