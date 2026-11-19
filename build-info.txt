@@ -1,0 +1,6 @@
+commit=2ea4dc9943e3cf328ca433fec8e48e27c82d51e2
+ref=main
+version_name=2.8.5
+version_code=35
+built_at=2026-11-19T10:23:01Z
+apk_sha256=28d46af76aec357933343b0ea34fe6cbcdf69713fd17fdde1b23840ca393501e
