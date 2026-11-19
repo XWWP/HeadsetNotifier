@@ -504,6 +504,12 @@ public class NotificationReaderService extends NotificationListenerService {
         super.onListenerConnected();
         Log.i(TAG, "onListenerConnected: listener is bound and ready.");
         rebindChainRunning = false;
+        // 绑定成功就把"监听掉线"的提醒和计时一并清掉，别让旧通知留在通知栏里
+        ListenerAlert.cancel(this);
+        getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE)
+                .edit()
+                .remove("listener_down_since_ms")
+                .apply();
         recordEvent("监听已连接");
         ensureKeepAliveIfNeeded();
         // 重新绑定后按当前条件恢复轮询，避免被系统解绑再绑定时轮询已停。
