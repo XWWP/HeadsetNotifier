@@ -86,6 +86,7 @@ git show origin/ci-status:ci-status.txt
 | `AppPickerActivity.java` | 白名单应用选择 |
 | `ShizukuChannel.java` | 无 root 时的降级通道（三条 shell 命令） |
 | `TextFormatter.java` | 播报文本清洗、验证码逐位展开 |
+| `VolumeBoost.java` | 播报音量提升与恢复：按 AudioAttributes 取流、写回校验、输出设备集校验 |
 | `KeepAliveService.java` | 前台保活服务（仅连接耳机时存在） |
 | `AnnounceTileService.java` / `BluetoothStateReceiver.java` / `BootReceiver.java` | 快捷磁贴、蓝牙广播、开机 |
 | `keepalive/` | root 保活模块（Magisk / KernelSU / APatch），独立打包，不参与 APK 构建 |
@@ -101,11 +102,12 @@ git show origin/ci-status:ci-status.txt
 - **焦点分级**：`AUDIOFOCUS_LOSS` 清队列；`TRANSIENT` / `CAN_DUCK` 只停当前这句、保留队列 5 秒后续播。一刀切清队列会让一句导航语音吞掉整批消息。
 - **状态刷新只有一个入口**：`buildLayout()` 末尾会调 `updateStatus()`，别在别处手拼状态文本，否则重建后会退回写死的初值。
 - **保护标记 `files/active` 的语义**：只有 `KeepAliveService` 在前台时才刷新（内容写毫秒时间戳，mtime 同步更新）。不要在 `NotificationReaderService` 的心跳里刷——监听服务的线程活着不代表前台服务活着，那样模块会把「进程在」误判成「服务在」，`STALE_BLOCK` 就再也不会降频。模块 v1.12 起同时看内容时间戳与前台服务活性复核。
+- **音量改哪条流由 Attributes 决定**：`VolumeBoost` 用 `AudioAttributes.getVolumeControlStream()` 取流（`USAGE_ASSISTANT` → `STREAM_ASSISTANT`），不要在调用处硬编码 `STREAM_MUSIC`。ColorOS 上两条流是独立 Volume Group（实测 `STREAM_MUSIC` max 160、`STREAM_ASSISTANT` max 16），硬编码会出现「改了音乐流、响在助手流上」，用户怎么调都对不上。
 - **prefs 监听已注册**：快捷磁贴改 `KEY_ENABLED` 会通过监听同步首页开关，改这块注意别造成回环。
 
 ## 已知未修（有意保留）
 
-- 通知轮询在主线程调 `getActiveNotifications()`，条目很多时有 ANR 风险（要改线程模型；2.8.6 仍在）。
+- 通知轮询在主线程调 `getActiveNotifications()`，条目很多时有 ANR 风险（要改线程模型；2.8.7 仍在）。
 - 耳机短暂断连期间到达的消息不补播（隐私取舍：宁可漏，不念旧消息）。
 - 勿扰时段里「开始 = 结束」被当作不生效，界面仍显示该时段。
 - 只有蓝牙音频设备会播报，3.5mm / USB-C 有线耳机不播（产品决策未定）。
@@ -277,3 +279,31 @@ isForeground=true types=0x00000010
 
 模块广播依赖应用 ≥ 2.7.6；旧版本没有 `WakeReceiver`，广播会失败，
 日志会记「拉起失败：进程未出现（检查应用是否为 2.7.6+）」。
+
+
+## 2026-11-24：音量恢复重做（2.8.7 / versionCode 37）
+
+### 问题
+
+真机取证：`STREAM_MUSIC` 为 `Max:160`、`bt_a2dp:40`，`STREAM_ASSISTANT` 为 `Max:16`、`bt_a2dp:7`，两者是独立 Volume Group。旧实现固定改 `STREAM_MUSIC`，而 TTS 用 `USAGE_ASSISTANT` 播放，属于「改一条流、响另一条流」；再加上 `setStreamVolume` 返回 void、写回零校验、`savedMusicVolume` 无条件清零，用户体感就是「播报音量经常调不回去」。
+
+### 修复
+
+- 新增 `VolumeBoost`：流由 `AudioAttributes.getVolumeControlStream()` 决定，与播报输出同源。
+- 每次写入读回校验；读回不符就不登记基准，避免在错误数值上“恢复”。
+- 恢复前三条判据：当前值仍等于本模块写入值、`getStreamMaxVolume` 未变、输出设备集未变（反射 `getDevicesForStream`，取不到就跳过该校验）；任一不满足即放弃写回，尊重用户操作与设备切换。
+- 写回失败做一次有界重试，仍失败写日志。
+- 测试播报与通知播报共用 `VolumeBoost`，删掉 `MainActivity` 里第二份 `testSavedVolume` 实现。
+- `DEFAULT_VOLUME_PERCENT` 80 → 60。
+
+### 同时修掉
+
+- `onAudioFocusLost` 未撤 `utteranceTimeoutGuard`：60 秒守卫会在 5 秒后重开的新批次上误触发，撤焦点、恢复音量，而 TTS 仍在念。现已在该路径 `removeCallbacks`。
+- 日志脱敏：`queued:` 与 `speak result=` 不再打印正文，只留长度（验证码逐位展开后的文本此前会进 logcat）。
+
+### 验证
+
+- 构建 `BUILD SUCCESSFUL`，装机 `versionName=2.8.7 / versionCode=37`，覆盖安装成功（签名一致）。
+- 广播唤醒后 `KeepAliveService is now foreground`、`TTS ready`、`onListenerConnected`。
+- 现场音量保持 `STREAM_ASSISTANT=7/16`、`STREAM_MUSIC=15/160`，未播报时不产生写入。
+- 待验证：下次真实播报时确认日志出现 `volume boosted X -> Y (max 16, stream 11)` 与 `volume restored to X`。

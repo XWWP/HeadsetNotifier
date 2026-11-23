@@ -52,7 +52,7 @@ public class MainActivity extends Activity {
     static final String KEY_DND_END = "dnd_end_hour";
     static final String KEY_POLL_INTERVAL = "poll_interval_ms";
 
-    static final int DEFAULT_VOLUME_PERCENT = 80;
+    static final int DEFAULT_VOLUME_PERCENT = 60;
     static final int DEFAULT_SPEECH_RATE = 100;
     static final int DEFAULT_POLL_INTERVAL_MS = 5000;
 
@@ -111,7 +111,7 @@ public class MainActivity extends Activity {
     private TextToSpeech testTts;
     private boolean testTtsReady;
     private boolean pendingSpeakAfterInit;
-    private int testSavedVolume = -1;
+    private VolumeBoost testVolumeBoost;
     private boolean guidePending;
 
     @Override
@@ -1599,26 +1599,26 @@ public class MainActivity extends Activity {
     }
 
     private void applyTestVolumeBoost() {
-        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
-        if (audioManager == null) {
-            return;
-        }
         int percent = preferences.getInt(KEY_VOLUME_PERCENT, DEFAULT_VOLUME_PERCENT);
-        int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-        int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-        int target = Math.round(max * percent / 100f);
-        if (target <= current) {
-            return;
+        if (ensureTestVolumeBoost().boost(testAudioAttributes(), percent)) {
+            // 引擎可能不回调，超时兜底；restore 幂等，重复触发无副作用
+            uiHandler.postDelayed(this::restoreTestVolume, 30000L);
         }
-        testSavedVolume = current;
-        try {
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
-        } catch (RuntimeException exception) {
-            testSavedVolume = -1;
-            return;
+    }
+
+    private VolumeBoost ensureTestVolumeBoost() {
+        if (testVolumeBoost == null) {
+            testVolumeBoost = new VolumeBoost(this);
         }
-        // 播报结束由 TTS 回调触发恢复；这里只做超时兜底，避免引擎不回调时音量卡住
-        uiHandler.postDelayed(this::restoreTestVolume, 30000L);
+        return testVolumeBoost;
+    }
+
+    /** 测试播报的音频属性必须与播报服务一致，音量才会落在同一条流上。 */
+    private static AudioAttributes testAudioAttributes() {
+        return new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build();
     }
 
     /**
@@ -1912,19 +1912,11 @@ public class MainActivity extends Activity {
         return bar;
     }
 
-    /** 测试播报结束（含被打断、被 mid-exit）后把媒体音量放回去。 */
+    /** 测试播报结束（含被打断、被 mid-exit）后把音量放回去。 */
     private void restoreTestVolume() {
-        if (testSavedVolume < 0) {
-            return;
+        if (testVolumeBoost != null) {
+            testVolumeBoost.restore();
         }
-        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
-        if (audioManager != null) {
-            try {
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, testSavedVolume, 0);
-            } catch (RuntimeException ignored) {
-            }
-        }
-        testSavedVolume = -1;
     }
 
     private void initializeTestTts() {
