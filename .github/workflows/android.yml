@@ -82,6 +82,17 @@ jobs:
             cp "$HOME/.android/debug.keystore" "$GITHUB_WORKSPACE/../.android-key"
             echo "已导出到 $GITHUB_WORKSPACE/../.android-key"
           fi
+          # tag 发布 fail-closed：密钥缺失或无法解码就直接失败，
+          # 否则会挂出一个签名与本机不同的包，用户覆盖安装必报签名冲突。
+          if [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+            case "$(cat /tmp/ks-source.txt 2>/dev/null)" in
+              secret|secret:XWWP|repo) ;;
+              *)
+                echo "::error::tag 发布需要可用的固定 keystore，当前来源=$(cat /tmp/ks-source.txt 2>/dev/null)。已终止，避免产出无法覆盖安装的包。"
+                exit 1
+                ;;
+            esac
+          fi
 
       - name: Build debug APK
         env:
@@ -179,6 +190,42 @@ jobs:
           COMMIT=$(git commit-tree "$TREE" -m "CI ${BUILD_STATUS} ${GITHUB_SHA::7}")
           git push -f origin "$COMMIT:refs/heads/ci-status"
 
+      # Release 说明按本次真实产物生成：版本号、签名来源、两个 sha256 都来自构建结果，
+      # 不再写「若配置了某 secret 则…」这种与实际状态脱钩的描述。
+      - name: Compose release body
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION_NAME=$(sed -n 's/.*versionName = "\(.*\)"/\1/p' app/build.gradle.kts)
+          VERSION_CODE=$(sed -n 's/.*versionCode = \([0-9]*\)/\1/p' app/build.gradle.kts)
+          APK_PATH=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+          APK_NAME=$(basename "$APK_PATH")
+          APK_SHA=$(cut -d' ' -f1 apk.sha256)
+          KS_SRC=$(cat /tmp/ks-source.txt 2>/dev/null || echo unknown)
+          MODULE_ZIP=$(ls airannounce-thaw-*.zip | head -1)
+          MODULE_SHA=$(sha256sum "$MODULE_ZIP" | cut -d' ' -f1)
+          FENCE='```'
+          {
+            echo "## 安装"
+            echo
+            echo "- \`$APK_NAME\`：版本 \`${VERSION_NAME} (${VERSION_CODE})\`，minSdk 26 / targetSdk 34，debug 签名"
+            echo "  与本仓库 CI 使用的固定 keystore 同源，可直接 \`pm install -r\` 覆盖升级"
+            echo "- \`$MODULE_ZIP\`：root 保活模块（Magisk / KernelSU / APatch），可选，不装不影响播报"
+            echo "- \`apk.sha256\`：APK 校验文件"
+            echo
+            echo "## 签名"
+            echo
+            echo "本次签名来源 \`$KS_SRC\`，证书 SHA-256 见 \`ci-status\` 分支的 \`signer_sha256\`。"
+            echo "tag 发布时密钥缺失或无法解码会直接失败，不会产出无法覆盖安装的包。"
+            echo
+            echo "## 校验"
+            echo
+            echo "$FENCE"bash
+            echo "echo \"$APK_SHA  $APK_NAME\" | sha256sum -c"
+            echo "echo \"$MODULE_SHA  $MODULE_ZIP\" | sha256sum -c"
+            echo "$FENCE"
+          } > release-body.md
+          cat release-body.md
+
       - name: Attach APK to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -187,13 +234,5 @@ jobs:
             app/build/outputs/apk/debug/*.apk
             apk.sha256
             airannounce-thaw-*.zip
+          body_path: release-body.md
           generate_release_notes: true
-          body: |
-            debug 签名包，可直接安装。
-
-            另附 root 保活模块 `airannounce-thaw-*.zip`（Magisk / KernelSU / APatch，可选）。
-
-            签名：若仓库配置了 `DEBUG_KEYSTORE_B64` secret，此包与本机自建包同签名，
-            可直接 `pm install -r` 覆盖；否则为临时密钥，覆盖安装会报签名不一致，需先卸载。
-
-            校验：见附带的 apk.sha256。
