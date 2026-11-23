@@ -11,7 +11,7 @@
 ## 项目
 
 - 仓库：https://github.com/XWWP/HeadsetNotifier （公开，分支 `main`）
-- 当前基线：tag `v2.7.5`，commit `69949b9`（请基于这个版本改，不要基于更新的假设）
+- 当前基线：app `2.8.6` / `36`，模块 `v1.12` / `13`（以 `app/build.gradle.kts` 与 `keepalive/module.prop` 为准）
 - 应用：「耳机通知播报」`com.sakura.airannounce`，连接蓝牙耳机时朗读新通知
 - 技术栈：纯 Java + Android framework API，**无 XML 布局、无第三方 UI 库**；界面全在 `MainActivity` 里用代码构建
 - 构建：Gradle 8.10.2 + AGP 8.8.2 + JDK 21，`compileSdk 35 / minSdk 26 / targetSdk 34`
@@ -24,7 +24,7 @@
 
 ## 硬性约束
 
-- **不要修改** `gradle.properties`（里面的 `android.aapt2FromMavenOverride` 是本机 ARM 设备专用）、`local.properties`、`.github/workflows/android.yml`
+- **不要修改** `gradle.properties`（只有说明注释，覆盖 aapt2 的配置属于本机 `~/.gradle`）、`local.properties`、`.github/workflows/android.yml`
 - 不要引入第三方依赖（保持"无依赖、不联网"的定位）；除非必要且在说明里写清理由
 - 文件编码 UTF-8（不带 BOM）；仓库里部分文件是 CRLF，**改动时保持原文件的换行风格**，不要整文件重排
 - 不要"顺手格式化"无关代码，patch 里只包含与问题直接相关的行，方便 review

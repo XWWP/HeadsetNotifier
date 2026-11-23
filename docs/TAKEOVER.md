@@ -106,7 +106,12 @@ cat /sys/fs/cgroup/apps/uid_10645/pid_<pid>/cgroup.freeze   # 0 运行，1 冻�
 
 ## 待办（按优先级，详见 `docs/SELF-CHECK-2026-11-06.md`）
 
-### P0-1 监听绑定自愈（建议实现方案）
+### P0-1 监听绑定自愈（建议方案，已作废）
+
+> **已作废（v1.7+）**：实际落地的是 `dumpsys notification` 段内匹配 + `cmd notification
+> disallow_listener/allow_listener` 切换（`keepalive/service.sh:139-173`），app 侧走
+> `ShizukuChannel.healListenerAsync`。下面这套 `files/listener_connected` 信标从未实现，
+> 保留仅为记录当时的取舍：
 
 不要用「每 5 分钟 dumpsys」这种重轮询。推荐：
 

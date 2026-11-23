@@ -29,7 +29,7 @@ bash /workspace/build.sh            # 等价于 gradle assembleDebug
 2. 用 JDK 21 + Gradle 8.10.2 编译；
 3. 把 `app-debug.apk` 复制到 `Download/QQ/`。
 
-`gradle.properties` 里的 `android.aapt2FromMavenOverride` 指向本机的 x86_64 aapt2，**只对本机有效**，CI 里必须去掉（workflow 已经用 `sed` 删掉）。
+本机如果需要覆盖 aapt2（ARM 设备 + QEMU），要在 `~/.gradle/gradle.properties` 里配 `android.aapt2FromMavenOverride`，不要写进仓库：仓库的 `gradle.properties` 只有一句说明注释，并没有提交该属性，CI 也不需要任何 `sed` 处理。
 
 安装（`/storage` 有 SELinux 限制，不能直接 `pm install`）：
 
@@ -75,7 +75,7 @@ git show origin/ci-status:ci-status.txt
 
 ## 版本号
 
-`app/build.gradle.kts` 的 `versionCode` / `versionName` 与 git tag 保持一致。CI 产物是临时 debug keystore 签名，和本机 debug 包签名不同，覆盖安装会冲突，需要先卸载。
+`app/build.gradle.kts` 的 `versionCode` / `versionName` 与 git tag 保持一致。CI 用仓库 secret 里的固定 debug keystore 签名（`AIRANNOUNCE_DEBUG_KEYSTORE` 走显式 signingConfig），证书 SHA-256 与本机一致（`0e341371…`，见 `docs/CI.md`），可以直接覆盖安装；只有 secret 缺失、回落到 AGP 临时密钥时才会出现签名冲突。
 
 ## 代码结构
 
@@ -100,11 +100,12 @@ git show origin/ci-status:ci-status.txt
 - **去重看 postTime**：`isNewNotification()` 里「文本相同 **且** postTime 未前进」才算重复；只看文本会吞掉同一人连发的相同消息。
 - **焦点分级**：`AUDIOFOCUS_LOSS` 清队列；`TRANSIENT` / `CAN_DUCK` 只停当前这句、保留队列 5 秒后续播。一刀切清队列会让一句导航语音吞掉整批消息。
 - **状态刷新只有一个入口**：`buildLayout()` 末尾会调 `updateStatus()`，别在别处手拼状态文本，否则重建后会退回写死的初值。
+- **保护标记 `files/active` 的语义**：只有 `KeepAliveService` 在前台时才刷新（内容写毫秒时间戳，mtime 同步更新）。不要在 `NotificationReaderService` 的心跳里刷——监听服务的线程活着不代表前台服务活着，那样模块会把「进程在」误判成「服务在」，`STALE_BLOCK` 就再也不会降频。模块 v1.12 起同时看内容时间戳与前台服务活性复核。
 - **prefs 监听已注册**：快捷磁贴改 `KEY_ENABLED` 会通过监听同步首页开关，改这块注意别造成回环。
 
 ## 已知未修（有意保留）
 
-- 通知轮询在主线程调 `getActiveNotifications()`，条目很多时有 ANR 风险（要改线程模型）。
+- 通知轮询在主线程调 `getActiveNotifications()`，条目很多时有 ANR 风险（要改线程模型；2.8.6 仍在）。
 - 耳机短暂断连期间到达的消息不补播（隐私取舍：宁可漏，不念旧消息）。
 - 勿扰时段里「开始 = 结束」被当作不生效，界面仍显示该时段。
 - 只有蓝牙音频设备会播报，3.5mm / USB-C 有线耳机不播（产品决策未定）。

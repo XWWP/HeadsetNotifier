@@ -89,7 +89,7 @@ CI 包     certificate SHA-256: cb6171de3554d08fafac422a07c20f894b951305d7d7aa33
 
 1. **GitHub secret（推荐）**：把本机 `~/.android/debug.keystore` 做 base64，
    存到仓库 secret `DEBUG_KEYSTORE_B64`。工作流会自动还原到 `$HOME/.android/debug.keystore`。
-   现成的 base64 已导出到 `/storage/emulated/0/Download/ci-debug-keystore.b64`。
+   base64 在 `~/.android/debug.keystore` 上生成后直接粘进 secret，不要在任何设备目录留明文副本；早期导出的 `/storage/emulated/0/Download/ci-debug-keystore.b64` 用完即删。
 2. **仓库内密钥**：把 keystore 放成 `ci/debug.keystore` 提交。省事，但密钥公开，
    任何人都能签一个本机可接受的"更新包"。除非仓库是私有的，否则不建议。
 

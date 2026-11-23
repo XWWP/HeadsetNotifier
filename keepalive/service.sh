@@ -52,6 +52,16 @@ log "守护启动 pid=$$ 版本=${VER:-未知}"
 # 有些 root shell（例如某些工具 App 的终端）跑在隔离的挂载命名空间里，
 # 看不到其他应用的私有目录。在这种环境里启动本脚本，$FLAG 永远不存在，
 # 于是永远停在低频模式、日志也不报错——"守护在跑但从不保护"，最难排查的那种。
+# v1.12 起自己用 nsenter 重入 init 命名空间再执行一次，AIRANNOUNCE_NS 防递归；
+# exec 保留 PID，单实例清理逻辑不受影响。
+if [ ! -d "$DATA" ] && [ -z "${AIRANNOUNCE_NS:-}" ] && command -v nsenter >/dev/null 2>&1; then
+    SELF=$MODDIR/service.sh
+    [ -f "$SELF" ] || SELF=$0
+    log "检测到隔离挂载命名空间，nsenter 重入 init 命名空间：$SELF"
+    export AIRANNOUNCE_NS=1
+    exec nsenter -t 1 -m -- "$SELF" "$@"
+fi
+
 if [ ! -d "$DATA" ]; then
     log "警告：看不到 $DATA，本实例很可能在隔离挂载命名空间里，将无法进入高频模式。请在开机时由模块自行启动，或用 nsenter -t 1 -m 启动"
 fi
@@ -80,15 +90,41 @@ LAST_FAIL_LOG=0
 WAKE_LOG_PID=""
 ENABLED=1
 RETRY=0
-# 标记被判陈旧后置 1：只有 app 重新 touch（mtime 变化）才恢复高频，
-# 避免残留标记让 2 秒循环整夜空转
+# 标记被判陈旧后置 1：只有 app 重新写入新鲜时间戳才恢复高频，
+# 避免残留标记让 5 秒循环整夜空转。v1.12 起除了等 app 刷新，还会周期性复核
+# 前台服务是否真的在线（见主循环里的「陈旧复核」），防止标记残留把模块永久锁死在 low。
 STALE_BLOCK=0
 FLAG_MTIME=0
+STALE_RECHECK=0
+STALE_OK=0
 log "系统就绪，开始守护"
 
 app_pid() {
     set -- $(pidof "$PKG" 2>/dev/null)
     echo "${1:-}"
+}
+
+# 保护标记的年龄（秒）。优先读文件内容里的毫秒时间戳（app 2.8.6+ 写入），
+# 读不到再回退 mtime。旧版 app 写的是空文件，这个回退分支必须保留，
+# 否则「新模块 + 旧 app」会把所有标记判成陈旧，反而制造永久广播循环。
+# 传入 NOW 可复用调用方已经算过的时间，省掉一次 fork（low 模式每 tick 都会问）。
+flag_age() {
+    NOW=${1:-$(date +%s)}
+    TS=$(cat "$FLAG" 2>/dev/null)
+    case "$TS" in
+        ''|*[!0-9]*)
+            MT=$(stat -c %Y "$FLAG" 2>/dev/null)
+            if [ -n "$MT" ]; then
+                echo $(( NOW - MT ))
+            else
+                echo 999999
+            fi
+            ;;
+        *)
+            [ ${#TS} -ge 13 ] && TS=$((TS / 1000))
+            echo $(( NOW - TS ))
+            ;;
+    esac
 }
 
 announce_enabled() {
@@ -221,15 +257,22 @@ thaw() {
 # 拒（实测 ColorOS 的 OplusHansManager 返回 "Not found"）。
 # 也不再用 am start-activity：会切前台并点亮屏幕，打扰用户（v1.5 的做法）。
 wake_app() {
-    # 以前"进程在就不再广播"，于是出现第三种死锁：
-    #   进程活着，但前台服务没起来（重启后常见），没有 files/active
-    #   → 模块停在 low；又不广播 → 没人叫 syncKeepAlive → 前台服务永远起不来。
-    # 现在：进程在但标记缺失时也要广播，只是把间隔从 60 秒放到 5 分钟，避免频繁打扰。
+    # 第三种死锁（v1.10 已修）：进程活着但前台服务没起来（重启后常见），没有
+    #   files/active → 模块停在 low；又不广播 → 没人叫 syncKeepAlive → 服务永远
+    #   起不来。
+    # 第四种死锁（v1.12 修）：重启前留下的旧标记还在，进程也被系统按通知监听绑定
+    #   起来了，但前台服务从未启动。旧逻辑「标记在就 return」把这种状态当成
+    #   "已受保护"，于是永不广播；而标记又只有服务启动时才会刷新 → 模块的
+    #   STALE_BLOCK 永久锁死。2026-11-22 22:46 起本机就这样空转了 21 小时。
+    # 现在只有「进程在 + 标记新鲜（<120s）+ 未判陈旧」才短路；标记陈旧按 60 秒
+    # 勤拉，标记缺失（应用不要求保护）仍按 5 分钟。
     NOW=$(date +%s)
     LIMIT=60
     if [ -n "$(app_pid)" ]; then
-        [ -f "$FLAG" ] && return 0
-        LIMIT=300
+        if [ -f "$FLAG" ] && [ "$STALE_BLOCK" != "1" ] && [ "$(flag_age "$NOW")" -lt 120 ]; then
+            return 0
+        fi
+        [ -f "$FLAG" ] || LIMIT=300
     fi
     [ $((NOW - LAST_WAKE)) -ge $LIMIT ] || return 0
     LAST_WAKE=$NOW
@@ -391,6 +434,31 @@ while true; do
     elif [ "$ENABLED" != "0" ]; then
         ENABLED=0
         log "播报开关已关闭，停止主动拉起"
+    fi
+
+    # 陈旧复核：只等 app 刷新标记会被「服务已起、标记没刷新」卡死。每 5 分钟
+    # （约 15 个 tick）看一次前台服务，连续 2 次确认在线才解除 STALE_BLOCK，
+    # 单次抖动不解锁，避免 high/low 反复横跳。
+    if [ "$STALE_BLOCK" = "1" ]; then
+        STALE_RECHECK=$((STALE_RECHECK + 1))
+        if [ "$STALE_RECHECK" -ge 15 ]; then
+            STALE_RECHECK=0
+            if foreground_ok; then
+                STALE_OK=$((STALE_OK + 1))
+                log "陈旧复核：前台服务在线（$STALE_OK/2）"
+                if [ "$STALE_OK" -ge 2 ]; then
+                    STALE_BLOCK=0
+                    STALE_OK=0
+                    TICK_HIGH=0
+                    FG_FAIL=0
+                    FLAG_MTIME=$(stat -c %Y "$FLAG" 2>/dev/null)
+                    log "服务活性复核通过，解除陈旧标记，恢复高频保护"
+                fi
+            elif [ "$STALE_OK" != "0" ]; then
+                STALE_OK=0
+                log "陈旧复核：前台服务又不在线，计数归零"
+            fi
+        fi
     fi
 
     TICK_IDLE=$((TICK_IDLE + 1))

@@ -1,5 +1,11 @@
 # HeadsetNotifier 修改意见（基于 TAKEOVER.md 与自检报告）
 
+> **状态（2026-11-23 更新）：本方案未采纳。** 实际落地的是 `dumpsys notification`
+> 段内匹配 + `cmd notification disallow_listener/allow_listener` 切换
+> （`keepalive/service.sh` + `ShizukuChannel.healListenerAsync`）；文中 `listener_connected`
+> 信标从未进入代码，保留本文仅作取舍记录。
+
+
 日期：2026-11-06（v2：加入版本门控与修复降级）
 对象：app 2.7.8 / versionCode 25，root 模块 v1.6 / versionCode 7
 依据文档：`HANDOVER.md`、`docs/TAKEOVER.md`、`docs/SELF-CHECK-2026-11-06.md`

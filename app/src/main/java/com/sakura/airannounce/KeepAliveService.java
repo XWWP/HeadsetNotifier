@@ -11,6 +11,11 @@ import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
 /**
  * 仅在蓝牙音频设备连接期间存活的前台服务。
  *
@@ -24,6 +29,7 @@ public class KeepAliveService extends Service {
     private static final int NOTIFICATION_ID = 1001;
 
     private static volatile boolean running;
+    private static volatile long lastStartRequestMs;
 
     static boolean isRunning() {
         return running;
@@ -53,6 +59,10 @@ public class KeepAliveService extends Service {
             if (!running) {
                 return;
             }
+            // 只有前台服务真的活着才刷新保护标记：模块据此区分「服务在线」与「进程残留的旧标记」。
+            // 服务一旦停掉，这个 tick 随之消失，标记自然变旧，模块就会降频 —— 与 TAKEOVER 里
+            // 「不要在通知心跳里刷 mtime」的约定一致（那条针对的是监听服务的心跳）。
+            touchActiveFlag();
             if (NotificationReaderService.getInstance() == null) {
                 unboundTicks++;
                 if (unboundTicks == ALERT_AFTER_TICKS) {
@@ -76,9 +86,16 @@ public class KeepAliveService extends Service {
     };
 
     static void start(Context context) {
-        if (running) {
+        // running 只表示「这个进程里曾经成功进过前台」。服务被系统悄悄收掉、或进程
+        // 重启后又回到 false，单看它会漏掉「标记残留但服务已不在」的状态，于是
+        // start() 静默早退、保护标记永不刷新。改成 5 秒时间窗去重：窗口内重复请求
+        // 忽略，窗口外再发一次 startForegroundService（幂等，重复调用只会重新走
+        // 一遍 onStartCommand 并刷新标记）。
+        long now = System.currentTimeMillis();
+        if (running && now - lastStartRequestMs < 5000L) {
             return;
         }
+        lastStartRequestMs = now;
         try {
             Intent intent = new Intent(context, KeepAliveService.class);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -127,17 +144,19 @@ public class KeepAliveService extends Service {
 
     /**
      * 创建或刷新保护标记。
-     * 守护脚本用 mtime 判断这个标记背后还有没有活着的进程：标记只由 app 写，
-     * 模块只读不删，这样不会出现"模块删了标记、app 没重建导致永久不保护"。
+     * 守护脚本优先读文件内容里的毫秒时间戳，mtime 只作为旧版本的回退信号；
+     * 标记只由 app 写，模块只读不删，这样不会出现"模块删了标记、app 没重建导致永久不保护"。
+     * 写内容而不是只 touch：setLastModified 只有秒级精度，同一秒内重复刷新等于没刷新。
      */
     private void touchActiveFlag() {
         try {
-            java.io.File flag = activeFlagFile();
-            if (!flag.exists()) {
-                flag.createNewFile();
+            File flag = activeFlagFile();
+            try (FileOutputStream out = new FileOutputStream(flag, false)) {
+                out.write(Long.toString(System.currentTimeMillis())
+                        .getBytes(StandardCharsets.UTF_8));
             }
             flag.setLastModified(System.currentTimeMillis());
-        } catch (java.io.IOException ignored) {
+        } catch (IOException ignored) {
         }
     }
 
