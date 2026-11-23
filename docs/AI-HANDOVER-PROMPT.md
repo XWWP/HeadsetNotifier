@@ -11,7 +11,7 @@
 ## 项目
 
 - 仓库：https://github.com/XWWP/HeadsetNotifier （公开，分支 `main`）
-- 当前基线：app `2.8.6` / `36`，模块 `v1.12` / `13`（以 `app/build.gradle.kts` 与 `keepalive/module.prop` 为准）
+- 当前基线：app `2.8.6` / `36`，模块 `v1.13` / `14`（以 `app/build.gradle.kts` 与 `keepalive/module.prop` 为准）
 - 应用：「耳机通知播报」`com.sakura.airannounce`，连接蓝牙耳机时朗读新通知
 - 技术栈：纯 Java + Android framework API，**无 XML 布局、无第三方 UI 库**；界面全在 `MainActivity` 里用代码构建
 - 构建：Gradle 8.10.2 + AGP 8.8.2 + JDK 21，`compileSdk 35 / minSdk 26 / targetSdk 34`
