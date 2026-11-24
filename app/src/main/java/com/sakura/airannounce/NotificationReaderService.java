@@ -917,24 +917,36 @@ public class NotificationReaderService extends NotificationListenerService {
      * 改哪条流由 speechAudioAttributes() 决定（USAGE_ASSISTANT 对应 STREAM_ASSISTANT），
      * 与播报实际输出同源，避免「改了音乐流、响在助手流上」。
      */
+    /**
+     * 播报不再改任何系统音量流。
+     *
+     * 2026-11-24 真机实测结论：
+     * 1. 播报走 STREAM_ASSISTANT（dumpsys 里 player 标 usage=USAGE_ASSISTANT / stream 11）；
+     * 2. 第三方应用对 STREAM_ASSISTANT 的 setStreamVolume 被 ColorOS 静默丢弃
+     *    （日志 volume boost dropped: want=10 got=6 stream=11）；
+     * 3. 改 STREAM_MUSIC 只影响用户音乐，对播报响度没有作用，还会造成音量波动。
+     * 因此播报响度改由 TTS 的 KEY_PARAM_VOLUME 增益控制（见 speechGain()），
+     * 它只作用于本句播放、不碰系统音量，也就不存在「改完调不回去」。
+     */
     private void boostVolumeForSpeech() {
-        if (audioManager == null) {
-            return;
-        }
+        // 调用点保留：增益在 speak() 时按 speechGain() 应用
+    }
+
+    /**
+     * 播报增益 0.1–1.0，对应设置里的播报音量百分比。
+     *
+     * 这是控制播报响度的主手段：TTS 的 KEY_PARAM_VOLUME 只影响本句的播放增益，
+     * 不碰任何系统音量流，因此不存在"改完调不回去"的问题。
+     */
+    private float speechGain() {
         SharedPreferences preferences =
                 getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE);
         if (!preferences.getBoolean(MainActivity.KEY_BOOST_VOLUME, true)) {
-            return;
+            return 1f;
         }
         int percent = preferences.getInt(MainActivity.KEY_VOLUME_PERCENT,
                 MainActivity.DEFAULT_VOLUME_PERCENT);
-        if (ensureVolumeBoost().boost(speechAudioAttributes(), percent)) {
-            if (preferences.getBoolean(MainActivity.KEY_VOLUME_KEY_FOLLOW, true)) {
-                ensureVolumeKeyBridge().open(speechAudioAttributes());
-            }
-            mainHandler.removeCallbacks(volumeSafetyRestore);
-            mainHandler.postDelayed(volumeSafetyRestore, VOLUME_SAFETY_TIMEOUT_MS);
-        }
+        return Math.max(0.1f, Math.min(1f, percent / 100f));
     }
 
     private VolumeBoost ensureVolumeBoost() {
@@ -1245,9 +1257,12 @@ public class NotificationReaderService extends NotificationListenerService {
         String utteranceId = UUID.randomUUID().toString();
         // 先登记再 speak：极短的语音可能在回调前就结束，顺序反过来会漏记
         activeUtterances.add(utteranceId);
+        Bundle speechParams = new Bundle();
+        speechParams.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, speechGain());
         int result = textToSpeech.speak(
-                announcement, TextToSpeech.QUEUE_ADD, new Bundle(), utteranceId);
-        Log.i(TAG, "speak result=" + result + " len=" + announcement.length());
+                announcement, TextToSpeech.QUEUE_ADD, speechParams, utteranceId);
+        Log.i(TAG, "speak result=" + result + " gain=" + speechGain()
+                + " len=" + announcement.length());
         recordEvent(result == TextToSpeech.SUCCESS ? "开始朗读" : "朗读失败 (code=" + result + ")");
         if (result == TextToSpeech.ERROR) {
             Log.e(TAG, "speak: TTS rejected the utterance.");

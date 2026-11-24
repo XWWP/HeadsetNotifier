@@ -23,8 +23,8 @@
 
     <string name="speech_rate_label">语速：%1$d%%</string>
     <string name="volume_label">音量：%1$d%%（播报时的目标媒体音量）</string>
-    <string name="boost_volume_title">播报时自动提高播报音量</string>
-    <string name="volume_key_follow_title">音量键控制播报音量</string>
+    <string name="boost_volume_title">启用播报音量增益</string>
+    <string name="volume_key_follow_title">音量键接管播报音量（部分机型无效）</string>
     <string name="beep_before_speech">播报前播放提示音</string>
 
     <string name="allowed_packages_desc">只播报列表内的应用。留空则播报所有应用（除本应用外）。</string>

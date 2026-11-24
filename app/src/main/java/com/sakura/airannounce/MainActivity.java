@@ -114,6 +114,8 @@ public class MainActivity extends Activity {
     private boolean testTtsReady;
     private boolean pendingSpeakAfterInit;
     private VolumeBoost testVolumeBoost;
+    /** 测试播报期间的音量键桥，与通知播报共用同一实现。 */
+    private VolumeKeyBridge testVolumeKeyBridge;
     private boolean guidePending;
 
     @Override
@@ -874,7 +876,7 @@ public class MainActivity extends Activity {
                 volumeLabel.setText(getString(R.string.volume_label, value)));
 
         addSwitch(content, R.string.boost_volume_title, KEY_BOOST_VOLUME, true);
-        addSwitch(content, R.string.volume_key_follow_title, KEY_VOLUME_KEY_FOLLOW, true);
+        addSwitch(content, R.string.volume_key_follow_title, KEY_VOLUME_KEY_FOLLOW, false);
         addSwitch(content, R.string.beep_before_speech, KEY_BEEP, true);
 
         showMiuixDialog(getString(R.string.section_sound), content, false,
@@ -1596,17 +1598,26 @@ public class MainActivity extends Activity {
         if (preferences.getBoolean(KEY_BOOST_VOLUME, true)) {
             applyTestVolumeBoost();
         }
+        if (preferences.getBoolean(KEY_VOLUME_KEY_FOLLOW, false)) {
+            ensureTestVolumeKeyBridge().open(testAudioAttributes());
+        }
         android.os.Bundle params = new android.os.Bundle();
         String testText = TextFormatter.expandVerificationCodes(getString(R.string.test_message));
+        int percent = preferences.getInt(KEY_VOLUME_PERCENT, DEFAULT_VOLUME_PERCENT);
+        float gain = preferences.getBoolean(KEY_BOOST_VOLUME, true)
+                ? Math.max(0.1f, Math.min(1f, percent / 100f))
+                : 1f;
+        params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, gain);
+        android.util.Log.i("AirAnnounce", "test speak gain=" + gain + " percent=" + percent);
         testTts.speak(testText, TextToSpeech.QUEUE_FLUSH, params, "test");
     }
 
+    /**
+     * 测试播报同样不改系统音量：响度由 speak 时的 KEY_PARAM_VOLUME 增益决定。
+     * 真机上 STREAM_ASSISTANT 对第三方应用不可写，改 STREAM_MUSIC 只会动用户音乐。
+     */
     private void applyTestVolumeBoost() {
-        int percent = preferences.getInt(KEY_VOLUME_PERCENT, DEFAULT_VOLUME_PERCENT);
-        if (ensureTestVolumeBoost().boost(testAudioAttributes(), percent)) {
-            // 引擎可能不回调，超时兜底；restore 幂等，重复触发无副作用
-            uiHandler.postDelayed(this::restoreTestVolume, 30000L);
-        }
+        // 保留调用点：增益在 speakTestMessage() 里应用
     }
 
     private VolumeBoost ensureTestVolumeBoost() {
@@ -1614,6 +1625,13 @@ public class MainActivity extends Activity {
             testVolumeBoost = new VolumeBoost(this);
         }
         return testVolumeBoost;
+    }
+
+    private VolumeKeyBridge ensureTestVolumeKeyBridge() {
+        if (testVolumeKeyBridge == null) {
+            testVolumeKeyBridge = new VolumeKeyBridge(this);
+        }
+        return testVolumeKeyBridge;
     }
 
     /** 测试播报的音频属性必须与播报服务一致，音量才会落在同一条流上。 */
@@ -1917,6 +1935,9 @@ public class MainActivity extends Activity {
 
     /** 测试播报结束（含被打断、被 mid-exit）后把音量放回去。 */
     private void restoreTestVolume() {
+        if (testVolumeKeyBridge != null) {
+            testVolumeKeyBridge.close();
+        }
         if (testVolumeBoost != null) {
             testVolumeBoost.restore();
         }

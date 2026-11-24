@@ -281,13 +281,16 @@ final class VolumeBoost {
         clearPersisted();
     }
 
+    /**
+     * 固定走 STREAM_MUSIC。
+     *
+     * 2026-11-24 真机实测：TTS 用 USAGE_ASSISTANT 播放时音量流是 STREAM_ASSISTANT，
+     * 但第三方应用调用 setStreamVolume(STREAM_ASSISTANT, ...) 会被 ColorOS 静默丢弃
+     * （日志 `volume boost dropped: want=10 got=6 stream=11`），只有 shell/root 能写。
+     * 因此系统音量这条腿固定用应用可写的 STREAM_MUSIC；
+     * 播报本身的响度由 TTS 的 KEY_PARAM_VOLUME 增益控制，两者互不干扰。
+     */
     private static int resolveStream(AudioAttributes attributes) {
-        if (attributes != null) {
-            try {
-                return attributes.getVolumeControlStream();
-            } catch (RuntimeException ignored) {
-            }
-        }
         return AudioManager.STREAM_MUSIC;
     }
 
