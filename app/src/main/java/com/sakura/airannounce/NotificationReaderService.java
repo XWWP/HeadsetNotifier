@@ -918,18 +918,31 @@ public class NotificationReaderService extends NotificationListenerService {
      * 与播报实际输出同源，避免「改了音乐流、响在助手流上」。
      */
     /**
-     * 播报不再改任何系统音量流。
+     * 播报前临时抬高音量的主手段。
      *
-     * 2026-11-24 真机实测结论：
-     * 1. 播报走 STREAM_ASSISTANT（dumpsys 里 player 标 usage=USAGE_ASSISTANT / stream 11）；
-     * 2. 第三方应用对 STREAM_ASSISTANT 的 setStreamVolume 被 ColorOS 静默丢弃
-     *    （日志 volume boost dropped: want=10 got=6 stream=11）；
-     * 3. 改 STREAM_MUSIC 只影响用户音乐，对播报响度没有作用，还会造成音量波动。
-     * 因此播报响度改由 TTS 的 KEY_PARAM_VOLUME 增益控制（见 speechGain()），
-     * 它只作用于本句播放、不碰系统音量，也就不存在「改完调不回去」。
+     * 2026-11-24 真机结论（A2DP + LHDC 绝对音量）：
+     * 1. 播报走 STREAM_ASSISTANT，但第三方应用写这条流会被 ColorOS 丢弃
+     *    （volume boost dropped: want=10 got=6 stream=11）；
+     * 2. 耳机侧只有一条绝对音量，映射自 STREAM_MUSIC；
+     *    所以「播报多响」实际由 STREAM_MUSIC 的 bt_a2dp 值决定，用户调节音量的手感也是它；
+     * 3. TTS 的 KEY_PARAM_VOLUME 仍作为本句增益叠加（speechGain()），
+     *    引擎采纳时多一层细调，不采纳也不影响主通道。
      */
     private void boostVolumeForSpeech() {
-        // 调用点保留：增益在 speak() 时按 speechGain() 应用
+        if (audioManager == null) {
+            return;
+        }
+        SharedPreferences preferences =
+                getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE);
+        if (!preferences.getBoolean(MainActivity.KEY_BOOST_VOLUME, true)) {
+            return;
+        }
+        int percent = preferences.getInt(MainActivity.KEY_VOLUME_PERCENT,
+                MainActivity.DEFAULT_VOLUME_PERCENT);
+        if (ensureVolumeBoost().boost(speechAudioAttributes(), percent)) {
+            mainHandler.removeCallbacks(volumeSafetyRestore);
+            mainHandler.postDelayed(volumeSafetyRestore, VOLUME_SAFETY_TIMEOUT_MS);
+        }
     }
 
     /**

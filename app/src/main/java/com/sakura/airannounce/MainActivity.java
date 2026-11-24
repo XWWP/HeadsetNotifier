@@ -1613,11 +1613,15 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 测试播报同样不改系统音量：响度由 speak 时的 KEY_PARAM_VOLUME 增益决定。
-     * 真机上 STREAM_ASSISTANT 对第三方应用不可写，改 STREAM_MUSIC 只会动用户音乐。
+     * 测试播报也要抬音量：A2DP 绝对音量下耳机只有一条音量（映射自 STREAM_MUSIC），
+     * 抬它就是抬播报响度；播完由 TTS 回调恢复。
      */
     private void applyTestVolumeBoost() {
-        // 保留调用点：增益在 speakTestMessage() 里应用
+        int percent = preferences.getInt(KEY_VOLUME_PERCENT, DEFAULT_VOLUME_PERCENT);
+        if (ensureTestVolumeBoost().boost(testAudioAttributes(), percent)) {
+            // 引擎可能不回调，超时兜底；restore 幂等
+            uiHandler.postDelayed(this::restoreTestVolume, 30000L);
+        }
     }
 
     private VolumeBoost ensureTestVolumeBoost() {
