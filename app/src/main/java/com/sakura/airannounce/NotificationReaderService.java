@@ -179,6 +179,8 @@ public class NotificationReaderService extends NotificationListenerService {
     private static final int MAX_TTS_INIT_RETRIES = 3;
     /** 播报音量提升与恢复。改哪条流由 speechAudioAttributes() 决定，不在调用处硬编码。 */
     private VolumeBoost volumeBoost;
+    /** 播报期间把音量键接到播报流上的媒体会话桥。 */
+    private VolumeKeyBridge volumeKeyBridge;
     /** 正在播报中的 utteranceId。用集合而非计数，避免 TTS 同时回调 onDone/onStop 把计数减成负数。 */
     private final Set<String> activeUtterances = new HashSet<>();
     /** 音量提升后的兜底恢复：无论回调是否到达，超时一定恢复原音量。 */
@@ -927,6 +929,9 @@ public class NotificationReaderService extends NotificationListenerService {
         int percent = preferences.getInt(MainActivity.KEY_VOLUME_PERCENT,
                 MainActivity.DEFAULT_VOLUME_PERCENT);
         if (ensureVolumeBoost().boost(speechAudioAttributes(), percent)) {
+            if (preferences.getBoolean(MainActivity.KEY_VOLUME_KEY_FOLLOW, true)) {
+                ensureVolumeKeyBridge().open(speechAudioAttributes());
+            }
             mainHandler.removeCallbacks(volumeSafetyRestore);
             mainHandler.postDelayed(volumeSafetyRestore, VOLUME_SAFETY_TIMEOUT_MS);
         }
@@ -946,9 +951,25 @@ public class NotificationReaderService extends NotificationListenerService {
 
     private void restoreVolumeAfterSpeech() {
         mainHandler.removeCallbacks(volumeSafetyRestore);
+        if (volumeKeyBridge != null) {
+            volumeKeyBridge.close();
+        }
         if (volumeBoost != null) {
             volumeBoost.restore();
         }
+    }
+
+    /** 兜底闹钟到点时调用，与常规恢复同一条路径，避免两套逻辑分叉。 */
+    void restoreVolumeFromSafetyAlarm() {
+        Log.i(TAG, "safety alarm restore requested");
+        restoreVolumeAfterSpeech();
+    }
+
+    private VolumeKeyBridge ensureVolumeKeyBridge() {
+        if (volumeKeyBridge == null) {
+            volumeKeyBridge = new VolumeKeyBridge(getApplicationContext());
+        }
+        return volumeKeyBridge;
     }
 
     @Override
@@ -1002,6 +1023,10 @@ public class NotificationReaderService extends NotificationListenerService {
             } catch (RuntimeException ignored) {
             }
             toneGenerator = null;
+        }
+        if (volumeKeyBridge != null) {
+            volumeKeyBridge.release();
+            volumeKeyBridge = null;
         }
         super.onDestroy();
     }

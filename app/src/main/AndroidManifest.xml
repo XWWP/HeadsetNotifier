@@ -74,6 +74,9 @@
             android:name=".WakeReceiver"
             android:exported="true" />
         <receiver
+            android:name=".VolumeRestoreReceiver"
+            android:exported="false" />
+        <receiver
             android:name=".BluetoothStateReceiver"
             android:exported="false">
             <intent-filter>

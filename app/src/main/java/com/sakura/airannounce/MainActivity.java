@@ -41,6 +41,8 @@ public class MainActivity extends Activity {
     static final String KEY_ENABLED = "announcements_enabled";
     static final String KEY_ALLOWED_PACKAGES = "allowed_packages";
     static final String KEY_BOOST_VOLUME = "boost_volume";
+    /** 播报期间把音量键接到播报流；与「自动提高播报音量」配套。 */
+    static final String KEY_VOLUME_KEY_FOLLOW = "volume_key_follow";
     static final String KEY_VOLUME_PERCENT = "volume_percent";
     static final String KEY_READ_APP_NAME = "read_app_name";
     static final String KEY_READ_TITLE = "read_title";
@@ -872,6 +874,7 @@ public class MainActivity extends Activity {
                 volumeLabel.setText(getString(R.string.volume_label, value)));
 
         addSwitch(content, R.string.boost_volume_title, KEY_BOOST_VOLUME, true);
+        addSwitch(content, R.string.volume_key_follow_title, KEY_VOLUME_KEY_FOLLOW, true);
         addSwitch(content, R.string.beep_before_speech, KEY_BEEP, true);
 
         showMiuixDialog(getString(R.string.section_sound), content, false,
