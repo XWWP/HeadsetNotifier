@@ -177,10 +177,7 @@ public class NotificationReaderService extends NotificationListenerService {
     private boolean ttsReady;
     private int ttsInitRetries;
     private static final int MAX_TTS_INIT_RETRIES = 3;
-    /** 播报音量提升与恢复。改哪条流由 speechAudioAttributes() 决定，不在调用处硬编码。 */
-    private VolumeBoost volumeBoost;
-    /** 播报期间把音量键接到播报流上的媒体会话桥。 */
-    private VolumeKeyBridge volumeKeyBridge;
+    private int savedMusicVolume = -1;
     /** 正在播报中的 utteranceId。用集合而非计数，避免 TTS 同时回调 onDone/onStop 把计数减成负数。 */
     private final Set<String> activeUtterances = new HashSet<>();
     /** 音量提升后的兜底恢复：无论回调是否到达，超时一定恢复原音量。 */
@@ -189,7 +186,7 @@ public class NotificationReaderService extends NotificationListenerService {
     private final Runnable volumeSafetyRestore = new Runnable() {
         @Override
         public void run() {
-            if (volumeBoost != null && volumeBoost.isActive()) {
+            if (savedMusicVolume >= 0) {
                 Log.w(TAG, "volume safety restore fired.");
                 restoreVolumeAfterSpeech();
             }
@@ -879,7 +876,7 @@ public class NotificationReaderService extends NotificationListenerService {
             pendingAnnouncements.removeFirst();
         }
         pendingAnnouncements.addLast(new PendingAnnouncement(key, text, now));
-        Log.i(TAG, "queued: len=" + text.length());
+        Log.i(TAG, "queued: " + text);
         recordEvent("入队播报：" + (text.length() > 40 ? text.substring(0, 40) + "…" : text));
     }
 
@@ -913,23 +910,11 @@ public class NotificationReaderService extends NotificationListenerService {
     }
 
     /**
-     * 播报前临时把音量提到用户设定的水平，播完恢复原值。
-     * 改哪条流由 speechAudioAttributes() 决定（USAGE_ASSISTANT 对应 STREAM_ASSISTANT），
-     * 与播报实际输出同源，避免「改了音乐流、响在助手流上」。
-     */
-    /**
-     * 播报前临时抬高音量的主手段。
-     *
-     * 2026-11-24 真机结论（A2DP + LHDC 绝对音量）：
-     * 1. 播报走 STREAM_ASSISTANT，但第三方应用写这条流会被 ColorOS 丢弃
-     *    （volume boost dropped: want=10 got=6 stream=11）；
-     * 2. 耳机侧只有一条绝对音量，映射自 STREAM_MUSIC；
-     *    所以「播报多响」实际由 STREAM_MUSIC 的 bt_a2dp 值决定，用户调节音量的手感也是它；
-     * 3. TTS 的 KEY_PARAM_VOLUME 仍作为本句增益叠加（speechGain()），
-     *    引擎采纳时多一层细调，不采纳也不影响主通道。
+     * 播报前临时把媒体音量提到用户设定的水平，播完恢复原值。
+     * 只在目标音量高于当前音量时才提升，不会主动压低用户音量。
      */
     private void boostVolumeForSpeech() {
-        if (audioManager == null) {
+        if (audioManager == null || savedMusicVolume >= 0) {
             return;
         }
         SharedPreferences preferences =
@@ -939,62 +924,34 @@ public class NotificationReaderService extends NotificationListenerService {
         }
         int percent = preferences.getInt(MainActivity.KEY_VOLUME_PERCENT,
                 MainActivity.DEFAULT_VOLUME_PERCENT);
-        if (ensureVolumeBoost().boost(speechAudioAttributes(), percent)) {
-            mainHandler.removeCallbacks(volumeSafetyRestore);
-            mainHandler.postDelayed(volumeSafetyRestore, VOLUME_SAFETY_TIMEOUT_MS);
+        int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+        int target = Math.round(max * percent / 100f);
+        if (target > current) {
+            try {
+                savedMusicVolume = current;
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
+                mainHandler.removeCallbacks(volumeSafetyRestore);
+                mainHandler.postDelayed(volumeSafetyRestore, VOLUME_SAFETY_TIMEOUT_MS);
+                Log.i(TAG, "volume boosted " + current + " -> " + target + " (max " + max + ")");
+            } catch (RuntimeException exception) {
+                savedMusicVolume = -1;
+                Log.w(TAG, "volume boost failed", exception);
+            }
         }
-    }
-
-    /**
-     * 播报增益 0.1–1.0，对应设置里的播报音量百分比。
-     *
-     * 这是控制播报响度的主手段：TTS 的 KEY_PARAM_VOLUME 只影响本句的播放增益，
-     * 不碰任何系统音量流，因此不存在"改完调不回去"的问题。
-     */
-    private float speechGain() {
-        SharedPreferences preferences =
-                getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE);
-        if (!preferences.getBoolean(MainActivity.KEY_BOOST_VOLUME, true)) {
-            return 1f;
-        }
-        int percent = preferences.getInt(MainActivity.KEY_VOLUME_PERCENT,
-                MainActivity.DEFAULT_VOLUME_PERCENT);
-        return Math.max(0.1f, Math.min(1f, percent / 100f));
-    }
-
-    private VolumeBoost ensureVolumeBoost() {
-        if (volumeBoost == null) {
-            volumeBoost = new VolumeBoost(getApplicationContext());
-        }
-        return volumeBoost;
-    }
-
-    /** 是否还有未恢复的音量提升。stopEverything 用它决定要不要走完整停机流程。 */
-    private boolean isVolumeBoostActive() {
-        return volumeBoost != null && volumeBoost.isActive();
     }
 
     private void restoreVolumeAfterSpeech() {
         mainHandler.removeCallbacks(volumeSafetyRestore);
-        if (volumeKeyBridge != null) {
-            volumeKeyBridge.close();
+        if (savedMusicVolume >= 0 && audioManager != null) {
+            try {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedMusicVolume, 0);
+                Log.i(TAG, "volume restored to " + savedMusicVolume);
+            } catch (RuntimeException exception) {
+                Log.w(TAG, "volume restore failed", exception);
+            }
+            savedMusicVolume = -1;
         }
-        if (volumeBoost != null) {
-            volumeBoost.restore();
-        }
-    }
-
-    /** 兜底闹钟到点时调用，与常规恢复同一条路径，避免两套逻辑分叉。 */
-    void restoreVolumeFromSafetyAlarm() {
-        Log.i(TAG, "safety alarm restore requested");
-        restoreVolumeAfterSpeech();
-    }
-
-    private VolumeKeyBridge ensureVolumeKeyBridge() {
-        if (volumeKeyBridge == null) {
-            volumeKeyBridge = new VolumeKeyBridge(getApplicationContext());
-        }
-        return volumeKeyBridge;
     }
 
     @Override
@@ -1048,10 +1005,6 @@ public class NotificationReaderService extends NotificationListenerService {
             } catch (RuntimeException ignored) {
             }
             toneGenerator = null;
-        }
-        if (volumeKeyBridge != null) {
-            volumeKeyBridge.release();
-            volumeKeyBridge = null;
         }
         super.onDestroy();
     }
@@ -1190,7 +1143,7 @@ public class NotificationReaderService extends NotificationListenerService {
         }
         service.mainHandler.post(() -> {
             if (service.pendingAnnouncements.isEmpty() && service.activeUtterances.isEmpty()
-                    && !service.isVolumeBoostActive()) {
+                    && service.savedMusicVolume < 0) {
                 // 已经在关着的空档：onResume 每次都调过来，别反复 stop 引擎刷日志
                 return;
             }
@@ -1270,12 +1223,9 @@ public class NotificationReaderService extends NotificationListenerService {
         String utteranceId = UUID.randomUUID().toString();
         // 先登记再 speak：极短的语音可能在回调前就结束，顺序反过来会漏记
         activeUtterances.add(utteranceId);
-        Bundle speechParams = new Bundle();
-        speechParams.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, speechGain());
         int result = textToSpeech.speak(
-                announcement, TextToSpeech.QUEUE_ADD, speechParams, utteranceId);
-        Log.i(TAG, "speak result=" + result + " gain=" + speechGain()
-                + " len=" + announcement.length());
+                announcement, TextToSpeech.QUEUE_ADD, new Bundle(), utteranceId);
+        Log.i(TAG, "speak result=" + result + " text=" + announcement);
         recordEvent(result == TextToSpeech.SUCCESS ? "开始朗读" : "朗读失败 (code=" + result + ")");
         if (result == TextToSpeech.ERROR) {
             Log.e(TAG, "speak: TTS rejected the utterance.");
@@ -1363,9 +1313,6 @@ public class NotificationReaderService extends NotificationListenerService {
             recordEvent("焦点被短暂抢占，已暂停，稍后继续");
         }
         activeUtterances.clear();
-        // 上一批排下的 60 秒守卫必须撤掉：它到点会把 5 秒后新起的批次一并判死，
-        // 撤焦点、恢复音量，而 TTS 还在念——听感就是「声音在、状态已结束」。
-        mainHandler.removeCallbacks(utteranceTimeoutGuard);
         if (textToSpeech != null) {
             textToSpeech.stop();
         }

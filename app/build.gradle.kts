@@ -16,8 +16,8 @@ android {
         applicationId = "com.sakura.airannounce"
         minSdk = 26
         targetSdk = 34
-        versionCode = 41
-        versionName = "2.9.1"
+        versionCode = 43
+        versionName = "2.9.3"
     }
 
     signingConfigs {

@@ -41,8 +41,6 @@ public class MainActivity extends Activity {
     static final String KEY_ENABLED = "announcements_enabled";
     static final String KEY_ALLOWED_PACKAGES = "allowed_packages";
     static final String KEY_BOOST_VOLUME = "boost_volume";
-    /** 播报期间把音量键接到播报流；与「自动提高播报音量」配套。 */
-    static final String KEY_VOLUME_KEY_FOLLOW = "volume_key_follow";
     static final String KEY_VOLUME_PERCENT = "volume_percent";
     static final String KEY_READ_APP_NAME = "read_app_name";
     static final String KEY_READ_TITLE = "read_title";
@@ -54,7 +52,7 @@ public class MainActivity extends Activity {
     static final String KEY_DND_END = "dnd_end_hour";
     static final String KEY_POLL_INTERVAL = "poll_interval_ms";
 
-    static final int DEFAULT_VOLUME_PERCENT = 60;
+    static final int DEFAULT_VOLUME_PERCENT = 80;
     static final int DEFAULT_SPEECH_RATE = 100;
     static final int DEFAULT_POLL_INTERVAL_MS = 5000;
 
@@ -113,9 +111,7 @@ public class MainActivity extends Activity {
     private TextToSpeech testTts;
     private boolean testTtsReady;
     private boolean pendingSpeakAfterInit;
-    private VolumeBoost testVolumeBoost;
-    /** 测试播报期间的音量键桥，与通知播报共用同一实现。 */
-    private VolumeKeyBridge testVolumeKeyBridge;
+    private int testSavedVolume = -1;
     private boolean guidePending;
 
     @Override
@@ -876,7 +872,6 @@ public class MainActivity extends Activity {
                 volumeLabel.setText(getString(R.string.volume_label, value)));
 
         addSwitch(content, R.string.boost_volume_title, KEY_BOOST_VOLUME, true);
-        addSwitch(content, R.string.volume_key_follow_title, KEY_VOLUME_KEY_FOLLOW, false);
         addSwitch(content, R.string.beep_before_speech, KEY_BEEP, true);
 
         showMiuixDialog(getString(R.string.section_sound), content, false,
@@ -1598,52 +1593,32 @@ public class MainActivity extends Activity {
         if (preferences.getBoolean(KEY_BOOST_VOLUME, true)) {
             applyTestVolumeBoost();
         }
-        if (preferences.getBoolean(KEY_VOLUME_KEY_FOLLOW, false)) {
-            ensureTestVolumeKeyBridge().open(testAudioAttributes());
-        }
         android.os.Bundle params = new android.os.Bundle();
         String testText = TextFormatter.expandVerificationCodes(getString(R.string.test_message));
-        int percent = preferences.getInt(KEY_VOLUME_PERCENT, DEFAULT_VOLUME_PERCENT);
-        float gain = preferences.getBoolean(KEY_BOOST_VOLUME, true)
-                ? Math.max(0.1f, Math.min(1f, percent / 100f))
-                : 1f;
-        params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, gain);
-        android.util.Log.i("AirAnnounce", "test speak gain=" + gain + " percent=" + percent);
         testTts.speak(testText, TextToSpeech.QUEUE_FLUSH, params, "test");
     }
 
-    /**
-     * 测试播报也要抬音量：A2DP 绝对音量下耳机只有一条音量（映射自 STREAM_MUSIC），
-     * 抬它就是抬播报响度；播完由 TTS 回调恢复。
-     */
     private void applyTestVolumeBoost() {
+        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audioManager == null) {
+            return;
+        }
         int percent = preferences.getInt(KEY_VOLUME_PERCENT, DEFAULT_VOLUME_PERCENT);
-        if (ensureTestVolumeBoost().boost(testAudioAttributes(), percent)) {
-            // 引擎可能不回调，超时兜底；restore 幂等
-            uiHandler.postDelayed(this::restoreTestVolume, 30000L);
+        int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+        int target = Math.round(max * percent / 100f);
+        if (target <= current) {
+            return;
         }
-    }
-
-    private VolumeBoost ensureTestVolumeBoost() {
-        if (testVolumeBoost == null) {
-            testVolumeBoost = new VolumeBoost(this);
+        testSavedVolume = current;
+        try {
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
+        } catch (RuntimeException exception) {
+            testSavedVolume = -1;
+            return;
         }
-        return testVolumeBoost;
-    }
-
-    private VolumeKeyBridge ensureTestVolumeKeyBridge() {
-        if (testVolumeKeyBridge == null) {
-            testVolumeKeyBridge = new VolumeKeyBridge(this);
-        }
-        return testVolumeKeyBridge;
-    }
-
-    /** 测试播报的音频属性必须与播报服务一致，音量才会落在同一条流上。 */
-    private static AudioAttributes testAudioAttributes() {
-        return new AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build();
+        // 播报结束由 TTS 回调触发恢复；这里只做超时兜底，避免引擎不回调时音量卡住
+        uiHandler.postDelayed(this::restoreTestVolume, 30000L);
     }
 
     /**
@@ -1937,14 +1912,19 @@ public class MainActivity extends Activity {
         return bar;
     }
 
-    /** 测试播报结束（含被打断、被 mid-exit）后把音量放回去。 */
+    /** 测试播报结束（含被打断、被 mid-exit）后把媒体音量放回去。 */
     private void restoreTestVolume() {
-        if (testVolumeKeyBridge != null) {
-            testVolumeKeyBridge.close();
+        if (testSavedVolume < 0) {
+            return;
         }
-        if (testVolumeBoost != null) {
-            testVolumeBoost.restore();
+        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audioManager != null) {
+            try {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, testSavedVolume, 0);
+            } catch (RuntimeException ignored) {
+            }
         }
+        testSavedVolume = -1;
     }
 
     private void initializeTestTts() {
