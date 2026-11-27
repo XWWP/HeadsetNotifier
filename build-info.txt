@@ -1,0 +1,6 @@
+commit=6b38d248d8f6a097704c9c87c0e4327f8d7fc8f5
+ref=v2.9.4
+version_name=2.9.4
+version_code=44
+built_at=2026-11-27T13:21:43Z
+apk_sha256=f23439eb955f38fad9fd9ffb4be05da0d3e4b16e90cf6dbc9e4acd452c54fe94
