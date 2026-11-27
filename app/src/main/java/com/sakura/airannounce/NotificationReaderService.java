@@ -1120,7 +1120,19 @@ public class NotificationReaderService extends NotificationListenerService {
      * 2. 超过 30 秒的内容直接丢弃，不念过期消息
      * 3. 队列超过上限时挤掉最早的
      */
-    private void enqueueAnnouncement(String key, String text, long postTime) {
+    /**
+     * 入队。
+     *
+     * 这个方法由 onNotificationPosted 在 binder 线程调用，而队列的消费方
+     * （drain / 收尾 / 焦点回调）全都在 mainHandler 上。两个线程直接改同一个
+     * ArrayDeque 会丢条目，遍历时还可能抛 ConcurrentModificationException。
+     * 所以入队本身也投递到 mainHandler，让「入队」与「投递」共用一条串行通道。
+     */
+    private void enqueueAnnouncement(final String key, final String text, final long postTime) {
+        mainHandler.post(() -> enqueueAnnouncementLocked(key, text, postTime));
+    }
+
+    private void enqueueAnnouncementLocked(String key, String text, long postTime) {
         long now = SystemClock.elapsedRealtime();
         // 进程被冻结时，通知回调会排队到解冻后才送达。这时 enqueuedAt 只是
         // 「刚收到」的时刻，而通知本身可能已经是十分钟前的了——验证码、导航、
@@ -1243,7 +1255,10 @@ public class NotificationReaderService extends NotificationListenerService {
     private void armStartGuard() {
         mainHandler.removeCallbacks(finishGuard);
         mainHandler.removeCallbacks(startGuard);
-        startGuardDueMs = SystemClock.elapsedRealtime() + START_GUARD_MS;
+        // 必须用 uptimeMillis：Handler.postDelayed 也是按 uptime 计时（不含系统休眠）。
+        // 用 elapsedRealtime 的话，设备深度休眠会被算成「迟到」，
+        // 把正常唤醒误判成解冻假超时。
+        startGuardDueMs = SystemClock.uptimeMillis() + START_GUARD_MS;
         startGuardGraced = false;
         mainHandler.postDelayed(startGuard, START_GUARD_MS);
     }
@@ -1255,7 +1270,7 @@ public class NotificationReaderService extends NotificationListenerService {
         long chars = currentItem == null ? 0L : currentItem.text.length();
         long guard = SPEECH_GUARD_BASE_MS + SPEECH_GUARD_PER_CHAR_MS * chars;
         guard = Math.min(guard, UTTERANCE_TIMEOUT_MS);
-        finishGuardDueMs = SystemClock.elapsedRealtime() + guard;
+        finishGuardDueMs = SystemClock.uptimeMillis() + guard;
         finishGuardGraced = false;
         mainHandler.postDelayed(finishGuard, guard);
     }
@@ -1747,7 +1762,7 @@ public class NotificationReaderService extends NotificationListenerService {
         // 假超时：进程刚被解冻时，到期的 guard 会比刚排进来的 onStart 先出队。
         // 实际触发时间比计划晚了 2 秒以上，说明线程被冻过，宽限一次。
         if (!startGuardGraced
-                && SystemClock.elapsedRealtime() - startGuardDueMs > 2_000L) {
+                && SystemClock.uptimeMillis() - startGuardDueMs > 2_000L) {
             startGuardGraced = true;
             Log.i(TAG, "start guard fired late (post-thaw), granting grace.");
             armStartGuard();
@@ -1770,7 +1785,7 @@ public class NotificationReaderService extends NotificationListenerService {
             return;
         }
         if (!finishGuardGraced
-                && SystemClock.elapsedRealtime() - finishGuardDueMs > 2_000L) {
+                && SystemClock.uptimeMillis() - finishGuardDueMs > 2_000L) {
             finishGuardGraced = true;
             Log.i(TAG, "finish guard fired late (post-thaw), granting grace.");
             armFinishGuard();

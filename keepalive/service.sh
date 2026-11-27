@@ -416,11 +416,16 @@ while true; do
         '' | *[!0-9]*) IF_TS=$NOW_S ;;
         esac
         IF_AGE=$((NOW_S - IF_TS))
-        if [ "$IF_AGE" -ge 600 ]; then
-            # 十分钟还没补回来，多半是用户自己撤了授权：不再替他改
+        if [ "$IF_AGE" -ge 120 ]; then
+            # 窗口长度要大于「一次切换耗时 + 节流」，否则两条规则会互相锁死：
+            # 切换本身要 11 秒左右，节流 30 秒，窗口 30 秒的话等节流放开时
+            # 窗口已经过期，于是永远补不回来（本机实测踩过）。
+            # 120 秒 ≈ 3 次尝试机会。同时也别放太长 —— 标记只证明「我们有过一次
+            # 内部事务」，不能证明用户这期间没去系统设置里主动撤销授权，
+            # 窗口越长，把用户撤销改回去的概率越大。
             rm -f "$HEAL_INFLIGHT"
-            log "切换标记超过 10 分钟，放弃自动补授权"
-        elif [ "$IF_AGE" -ge 5 ]; then
+            log "切换标记超过 120 秒仍在，放弃自动补授权"
+        elif [ "$IF_AGE" -ge 5 ] && [ "$IF_AGE" -lt 120 ]; then
             if listener_granted; then
                 if listener_bound_now; then
                     rm -f "$HEAL_INFLIGHT"
@@ -535,17 +540,18 @@ while true; do
             # 每 5 拍（约 25 秒）顺手解冻一次 TTS 引擎：只解冻不拉起，
             # 引擎由系统按需 bind。放高频块里是因为它只在「有耳机要播报」时才有意义。
             if [ -n "$TTS_PKG" ] && [ $((TICK_HIGH % 5)) -eq 0 ]; then
-                TTS_PID=$(pidof "$TTS_PKG" 2>/dev/null | awk '{print $1}')
-                if [ -n "$TTS_PID" ]; then
+                # 用 pgrep -f 而不是 pidof：真正做合成的是子进程
+                # （本机是 com.oplus.ttsaccessibilityengine:tts），
+                # pidof 只认进程名等于包名的那个，会漏掉它。
+                for TTS_PID in $(pgrep -f "$TTS_PKG" 2>/dev/null); do
                     TTS_FREEZE_F=$(freeze_file_of "$TTS_PID")
-                    if [ -n "$TTS_FREEZE_F" ] && [ -r "$TTS_FREEZE_F" ]; then
-                        read -r TTS_FROZEN <"$TTS_FREEZE_F" 2>/dev/null
-                        if [ "$TTS_FROZEN" = "1" ] \
-                            && echo 0 >"$TTS_FREEZE_F" 2>/dev/null; then
-                            log "顺带解冻 TTS 引擎 $TTS_PKG pid=$TTS_PID"
-                        fi
+                    [ -n "$TTS_FREEZE_F" ] && [ -r "$TTS_FREEZE_F" ] || continue
+                    read -r TTS_FROZEN <"$TTS_FREEZE_F" 2>/dev/null
+                    if [ "$TTS_FROZEN" = "1" ] \
+                        && echo 0 >"$TTS_FREEZE_F" 2>/dev/null; then
+                        log "顺带解冻 TTS 引擎 pid=$TTS_PID"
                     fi
-                fi
+                done
             fi
             # 一分钟做一次状态复查：开关、前台服务是否还在
             if [ $((TICK_HIGH % 12)) -eq 0 ]; then
