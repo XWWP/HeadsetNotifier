@@ -455,3 +455,274 @@ if listener_granted && ! listener_bound; then fix_listener; fi
 ### 复测（升级到 2.8.5 后装包触发的解绑）
 
 `pm install -r` 会让监听解绑，装完约 70 秒内恢复绑定，无需人工干预。
+
+---
+
+## 应用 → 守护模块的反向请求通道（2.9.4 / 模块 v1.16）
+
+### 起因：应用自己 su 在 KernelSU 上是死路
+
+这次试着给应用补一条 root 自愈腿（`RootChannel`，用 su 直接拿 uid 0），实测发现根本走不通：
+
+```sh
+# 以 app uid 执行
+$ /system/bin/su 10645 -c "/system/bin/su -c 'id -u'"
+/system/bin/sh: /system/bin/su: inaccessible or not found
+```
+
+应用侧对应的日志是：
+
+```
+I AirAnnounce: root probe failed: IOException
+I AirAnnounce: root available=false
+```
+
+判据说明：`su 10645 -c "id -u"` 能返回 10645（root 自己调用 OK），app uid 却连二进制都看不到：
+
+```sh
+$ su 10645 -c "ls -la /system/bin/su"
+ls: /system/bin/su: No such file or directory
+$ su 10645 -c "stat -c '%a %U %Z' /system/bin/su"
+stat: '/system/bin/su': No such file or directory
+```
+
+注意这里是 **ENOENT**，不是 EACCES：`inaccessible or not found` 是 shell 找不到命令的措辞，
+SELinux 拒绝会是 `Permission denied`。根因在 KernelSU 的授权模型 —— 它只对**已授予 root 的
+UID** 做 su 的 exec 重定向，未授权的 app uid 在文件系统层面就看不到该文件，fork/exec 直接失败。
+所以这不是「没授权」，而是「没授权时连 su 二进制都不可见」；换绝对路径、换 PATH 都不解决。
+
+同时 KernelSU 的 CLI 没有任何「加授权」子命令（`ksud --help` 只有 module / profile /
+sepolicy 等），授权只能通过管理器 UI 点，而 UI 弹窗只有在 exec 成功的前提下才会出现。
+
+结论：**「有 root 就让应用自己提权」这个设计在 KernelSU 上不成立。**
+
+### 方案：应用投递请求，守护代执行
+
+应用侧写自己的私有目录不需要任何权限，这条路天然可用。
+
+| 方向 | 文件 | 内容 | 谁写 | 谁读 |
+|---|---|---|---|---|
+| 应用 → 模块 | `files/heal_request` | 毫秒时间戳 | 应用 | 守护（root） |
+| 模块 → 应用 | `files/module_seen` | 秒级时间戳 | 守护（root） | 应用 |
+
+要点：
+
+- `heal_request` 用「写临时文件 → fsync → rename」落盘，守护随时可能来读，
+  读到半个时间戳会被当成新请求反复触发。
+- 守护只认**内容变化**（`LAST_HEAL_REQ`），应用保留文件不删，避免写删竞争。
+- 守护处理前会 `listener_granted && ! listener_bound_now` 复查一遍，
+  监听其实正常就只记一行日志、不瞎切。
+- `module_seen` 由守护每分钟刷 mtime，写完必须 `chown` 回应用 uid ——
+  root 属主的 600 文件 untrusted_app 读不到，心跳就白写了。
+- 应用判存活只看 `module_seen` 的 mtime（3 分钟内算活），不读 `/data/adb`
+  （untrusted_app 读不到）。
+
+### 自愈优先级（`ListenerHeal`）
+
+1. `ModuleChannel`（守护模块）—— 有 root 时唯一可靠通道
+2. `RootChannel`（su）—— Magisk / 已授权 KernelSU 上仍可用，没装模块时的补充
+3. `ShizukuChannel` —— 没有 root 的设备上的降级方案
+4. `NotificationReaderService.requestRebindIfNeeded` —— 官方 API，本 ROM 上常是空操作
+
+### 实测
+
+```
+20:11:38 守护启动 pid=28873 版本=v1.16
+20:11:54 收到应用监听修复请求（1795781513585）
+20:11:54 复查后监听仍正常，忽略该请求
+```
+
+UI 同步改成三态，不再只认 su 和 Shizuku：
+
+```
+提权通道：守护模块（root）｜状态：已安装，但 Shizuku 未运行（重启后需重新激活）
+```
+
+本机实测：`pm install -r` 装包触发的解绑，10 秒内自动 rebind 恢复（走的是应用自身
+重绑路径，还没轮到模块出手）。
+
+### 已知限制
+
+- `RootChannel` 在本机永远返回 false（ENOENT：KernelSU 只对已授权 UID 重定向 su），
+  保留它是为了 Magisk 设备和「已授权且能 exec su」的 KernelSU 变种，
+  不要因为本机不走它就删掉。探测失败按 5 分钟缓存，不会每次自检都抛一次 IOException。
+- `fix_listener` 会阻塞守护循环约 7 秒（disallow → sleep 1 → allow → 复查），
+  期间解冻节拍顺延，不影响功能。
+
+---
+
+## 第二轮：闭合性修复（应用 2.9.x / 模块 v1.17）
+
+第一轮改完之后 Claude 的复审结论是「方向对，但两处都缺闭合性——状态没串行化，异常出口没收口」。
+这一轮就是补闭合：把「异常出口」逐个补上，并给每一条第一次拿到实测证据。
+
+### 1 自愈窗口回滚（最危险的一条）
+
+**问题**：切换绑定是 `disallow → sleep 1 → allow`，中间有一段授权为空的窗口。
+执行者（守护 / su / Shizuku / 发起请求的应用进程）在这个窗口里被杀、被冻、被重启，
+权限就停在空的状态；而之后每一条自愈路径的前置条件都是「权限本来就在」，
+永远不成立 —— 监听永久关闭，只能人工去系统设置里重新授权。
+
+**做法**：动手前落盘一个「切换中」标记，补回或确认已绑定后再删。两侧各用各的文件，刻意不共用：
+
+| 执行方 | 标记文件 | 理由 |
+|---|---|---|
+| 应用自己的 Root / Shizuku 通道 | `files/heal_inflight`（应用私有目录） | 应用只能写自己的目录 |
+| root 守护 | `$MODDIR/heal_inflight`（模块目录） | 守护往应用目录写要处理属主与 SELinux 标签；且 FBE 解锁前应用目录对守护不可见，而开机早期崩溃正是要防的场景 |
+
+守护每个节拍（5 秒）检查自己的标记：
+
+- 年龄 < 5 秒 → 不动手（`fix_listener` 可能正跑在同一拍的后台子进程里，抢跑会破坏它自己的 sleep）
+- `listener_granted=false` → **立即补 `allow_listener`**（这就是要救的状态，不等 20 秒）
+- `granted=true` 但未绑定且年龄 ≥ 20 秒 → 重新切一次
+- 年龄 > 10 分钟 → 删标记放弃（多半是用户自己撤了授权，不能替他改回去）
+
+`fix_listener` 自身补了两件事：前置写标记；**成功判定从「信退出码」改成 `listener_bound_now && listener_granted`**
+（`cmd` 在多数失败情形下也返回 0，只有 `enabled_notification_listeners` 里真的还有本组件才算授权回来了）。
+另外加 30 秒节流 —— 本机实测没有节流时会连切 3 次，越切越乱。
+
+**实测**（首次跑通这条路径，此前只有「复查后忽略」分支的证据）：
+
+```
+20:34:39 上次切换把授权撤掉了（12 秒），立即补 allow_listener
+20:34:41 监听已补回
+```
+撤销前授权数 1 → 手工 `disallow` 后 0 → 守护补回后 1，`heal_inflight` 已删除。
+
+真实 `fix_listener` 执行分支的证据（装包触发的解绑）：
+
+```
+20:33:57 监听未绑定（权限仍在），执行 disallow/allow 切换
+20:34:01 监听已重新绑定
+20:42:16 距上次切换不足 30 秒（20 秒），本轮跳过
+```
+
+### 2 播报音量落盘保险
+
+**问题**：boost 之后原音量只在内存里，进程被冻进 freezer 时 app 内定时器停摆，
+音量停在抬高值上一直冲耳朵。
+
+**做法**：新增 `SpeechVolumeGuard`，文件 `files/volume_original`，内容是
+
+```
+original  target  max  leaseUntilWallMs  deviceKind
+```
+
+三个关键设计，都是为了避免「保险把自己弄成事故」：
+
+1. **租约**。文件在整个会话期间都存在；只看「文件在」就恢复，会把念到一半的音量压回去。
+   每次开口都续租 `leaseUntil`，别人只在租约过期后才动手。
+2. **设备**。音量按输出设备分别存。耳机已拔却把原值写进去，写的是扬声器那一档，
+   耳机那一档还留在 boost 值上 —— 下次连上直接炸耳朵。记录了 `bt/other`，设备对不上就先不动。
+3. **比对**。恢复前比对 `当前 ≈ target`（±1 档容差，A2DP 绝对音量有取整）。
+   用户自己拧过音量就不覆盖他的选择，直接弃文件。
+
+配套：还原延迟 400ms（A2DP 管线 200~300ms，`onDone` 往往早于声音真正放完，立刻还原会削掉尾音），
+且延迟任务执行时若已有新会话在念就放手 —— 否则它会把新会话刚提上去的音量和刚写的记录一起抹掉。
+
+**这一轮修掉的真 bug**：`restoreVolumeAfterSpeech()` 原来无条件 `SpeechVolumeGuard.clear()`，
+即使本轮根本没提过音量。实测直接把「另一个会话正在用的租约」删掉了（写一个 lease 未到期的标记，
+12 秒后文件消失）。现在只有 `savedMusicVolume >= 0`（本进程确实提过）才允许删。
+
+**守护侧不再用命令行改音量**。本机实测 `cmd media_session volume --stream 3 --set N` 会 clamp：
+
+```
+set 26  → 16
+set 60  → 50
+set 140 → 100
+```
+
+拿它「还原」等于随机改用户音量，戴耳机时就是往耳朵里怼（测试过程中确实把音量推到过 100，
+当场炸了使用者的耳朵，这个操作方式已废弃）。守护现在只做一件事：标记过期就 `wake_app`
+（30 秒防重入），让应用自己用 `AudioManager` 精确还原。
+
+**实测**：
+- 租约未到期写入标记，12 秒后文件仍在（不动手）✔
+- 租约过期后，应用侧 20 秒内清理掉文件 ✔
+- 待验证：真实 boost → 延迟 400ms 还原（需要在没有戴耳机的时候做，避免再出声）
+
+### 3 su 归因修正
+
+`inaccessible or not found` 是 shell 找不到命令（**ENOENT**），SELinux 拒绝会是 `Permission denied`。
+根因是 KernelSU 只对**已授予 root 的 UID** 做 su 的 exec 重定向，未授权的 app uid 在文件系统层面看不到该文件：
+
+```sh
+$ su 10645 -c "ls -la /system/bin/su"
+ls: /system/bin/su: No such file or directory
+$ su 10645 -c "stat -c '%a %U %Z' /system/bin/su"
+stat: '/system/bin/su': No such file or directory
+```
+
+改掉的位置：`docs` 本节上文、`ListenerHeal` 类注释、`ModuleChannel` 类注释、`MainActivity` 的两处说明文案、
+`service.sh` 主循环里那条注释。`RootChannel` 保留（Magisk 与已授权 KernelSU 变种仍需要），
+探测失败按 5 分钟缓存，不再每次自检都抛一次 IOException。
+
+### 4 队列年龄顺延设上限 + 过期条目合并
+
+原来 `deferQueueAge()` 把整队 `queuedAt` 直接推到当下，**无上限**：一个 40 分钟的电话结束后，
+会把 40 分钟前的通知一条条念出来。现在：
+
+- 每条记录 `enqueuedAt`（原始进队时刻，永不改）作为基线
+- 顺延上限 `QUEUE_AGE_DEFER_MAX_MS = 60s`，即 `queuedAt = min(now, enqueuedAt + 60s)`
+- 顺延后仍然过期的条目**合并成一条摘要**「已跳过 n 条未播报的通知」入队，而不是静默丢弃；
+  摘要自身不参与再合并，新摘要替换旧摘要并累加计数（避免「摘要的摘要」）
+
+### 5 CAN_DUCK 不再主动压音量
+
+原来收到 `AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK` 就把 `STREAM_MUSIC` 压一半。问题是 boost/restore 动的是
+**同一条流**，导航提示音、用户自己的音乐都在上面，压一半等于把它们一起压掉；
+而通知是叠在导航上面的语音，压自己并不会让自己「更清楚」。
+
+现在只保持继续播、不碰音量（`CONTENT_TYPE_SPEECH` 的 duck 交给系统），同时删掉了 GAIN 分支里的「抬回」——
+不删的话它会把音量抬到一个错误的值。
+
+### 6 暂停态禁止投递 + 延迟还原
+
+- 新增 `PAUSED` 态：`drainAnnouncementQueue()` 在非 `IDLE` 时直接返回，暂停期间不会念下一条
+- 暂停时不还原音量（会话还要继续，还原会掉一下声音）
+- 出口都在：`GAIN` → `resumeFromPause()`；永久 `LOSS` → 清队并收尾；焦点申请被拒 → 3 秒后重试；
+  暂停 5 秒后兜底 `resumeFromPause()`
+- `stopEverything` / 拔耳机 / 服务销毁 / 永久丢焦点 → `endSpeechSessionNow()`（立即还原，不延迟 400ms）
+
+### 7 收成显式状态机
+
+11 条补丁叠在 6 个独立布尔上，任何一处出口忘了置位就是「焦点和抬高后的音量一直挂着」。现在：
+
+| 项 | 做法 |
+|---|---|
+| 态 | `SpeechPhase{IDLE, SPEAKING, PAUSED}`，所有出口走 `finishSession()` |
+| 回调归属 | `activeToken` 单一 token；对不上的回调一律丢弃（冻结期 oneway 回调解冻后集中爆发） |
+| token 编码 | `s<会话>-<条目>-r<重试>-p<重播>`，重试与重播分开计数，避免和上一次失败的幽灵回调撞 id |
+| 守卫 | 拆两段：启动守卫 5s（引擎不开口）+ 完成守卫按字数（封顶 60s） |
+| 假超时 | 守卫实际触发比计划晚 2 秒以上 → 说明线程被冻过，宽限一次后重新武装 |
+| 重试 | `MAX_SPEAK_RETRIES = 2`；连续失败 3 次重建引擎 |
+| 重建 | 退避 3s×n（封顶 30s），每小时最多 6 次，超限后只记录不再重建 |
+| 不变量 | `finishSession()` 末尾检查 `activeToken / currentItem / audioFocusRequest` 是否清空，不清就写警告 |
+| 线程 | 所有引擎回调 `post` 到同一个 `mainHandler`，串行化状态迁移 |
+
+**实测**（真实通知，白名单内应用）：
+
+```
+20:41:38.539 queued: Eta。后台命令已完成。播报验证2
+20:41:38.542 requestAudioFocus granted=true
+20:41:38.579 speak result=0
+20:41:38.582 TTS onStart s1-1-r0-p0
+20:41:42.379 TTS onDone  s1-1-r0-p0
+```
+
+`onStart → onDone` 严格配对，token 格式正确，无重复回调、无守卫误触发。
+
+### 8 module_seen 升级为「心跳 + 回执」
+
+内容从单个秒级时间戳改成 `ts ver last_req result`（如 `1795783331 v1.17 1795783313949 fixed`），
+同时当心跳和请求回执 —— 只靠 `onListenerConnected` 当回执有洞：
+守护「复查后忽略」那条分支不会产生该回调，应用只看到沉默，分不清「模块没在」和「监听本来就好」。
+写入后 `chown` 连组一起交还（原来只改 user，组仍是 root），并补 `restorecon`。
+
+### 本轮尚未完成（按 Claude 排序）
+
+1. `IMPORTANCE_MIN` 自检通知探针，替换「沉默多久就判死」的误判源头
+2. 补扫 watermark：`lastProcessedPostTime` 落盘，补扫只处理比它新的、按 postTime 排序、限 3 条其余并入摘要
+   （现在 `key+postTime` 不够：进程重启后 `announced` 集合丢失，补扫会把通知栏里没划掉的全念一遍）
+3. 真实 boost → 延迟 400ms 还原的实测（需无耳机时段）
+4. 状态机异常路径脚本化测试（抽 `TtsEngine` 接口 + 假引擎喂乱序/迟到/重复回调）

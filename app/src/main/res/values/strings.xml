@@ -35,7 +35,8 @@
     <string name="dnd_enabled">启用勿扰时段</string>
     <string name="dnd_range_label">静音时段：%1$s 至 %2$s（此期间不播报）</string>
 
-    <string name="poll_interval_label">后台轮询间隔：%1$.1f 秒（越小越及时，越大越省电）</string>
+    <string name="poll_interval_label">后台轮询间隔：%1$.1f 秒（最快档，自适应只会在此基础上放慢）</string>
+    <string name="adaptive_poll">智能省电轮询（长时间补不到东西时自动放慢）</string>
 
     <string name="copy_uninstall_command">复制卸载命令</string>
     <string name="copied_to_clipboard">已复制到剪贴板</string>

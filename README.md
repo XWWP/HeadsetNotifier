@@ -61,6 +61,6 @@ App 把媒体音量抬到多少，耳机都可能通过 AVRCP 同步回它自己
 
 ## 版本与发布
 
-当前 app `2.9.3 (43)`，保活模块 `v1.13 (14)`，`minSdk 26` / `targetSdk 34` / `compileSdk 35`。
+当前 app `2.9.3 (43)`，保活模块 `v1.14 (15)`，`minSdk 26` / `targetSdk 34` / `compileSdk 35`。
 
 构建产物与校验值发布在 [Releases](https://github.com/XWWP/HeadsetNotifier/releases)：`app-debug.apk`、`apk.sha256`、`airannounce-thaw-*.zip`。

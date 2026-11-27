@@ -32,7 +32,7 @@ public class WakeReceiver extends BroadcastReceiver {
         MainActivity.syncKeepAlive(context);
         // 这条路径不依赖前台服务：2026-11-19 的死锁里前台服务起不来，
         // 只有广播还能到达，所以修监听和发提醒都得在这儿也做一遍。
-        if (!ShizukuChannel.healListenerAsync(context)) {
+        if (!ListenerHeal.healAsync(context)) {
             NotificationReaderService.requestRebindIfNeeded(context);
         }
         maybeAlert(context);

@@ -31,10 +31,37 @@ public class NotificationReaderService extends NotificationListenerService {
     private static final String TAG = "AirAnnounce";
     private static final long DUPLICATE_WINDOW_MS = 120_000L;
     private static final int MAX_PENDING_ANNOUNCEMENTS = 5;
-    private static final int MAX_BODY_LENGTH = 300;
+    /**
+     * 正文朗读上限。300 字对"听完一条通知"来说太长：一条长群消息能念叨十几秒，
+     * 后面排队的消息全部被拖延迟；配合逐条投递后重播代价也更小。
+     */
+    private static final int MAX_BODY_LENGTH = 120;
     /** 队列里超过这个年龄的内容直接丢弃，避免念出几分钟前的旧消息。 */
     private static final long MAX_QUEUE_AGE_MS = 30_000L;
+    /** 单条 utterance 守卫的封顶值。实际时长按字数估算，见 SPEECH_GUARD_BASE_MS。 */
     private static final long UTTERANCE_TIMEOUT_MS = 60_000L;
+    /**
+     * 逐条投递后每条 utterance 都要单独计时，固定 60 秒对短播报太宽松、
+     * 对 120 字长播报又不够用（4 字/秒就要 30 秒，再叠加引擎起播延迟）。
+     * 改成「15 秒起步 + 每字 0.4 秒」，封顶 UTTERANCE_TIMEOUT_MS。
+     */
+    private static final long SPEECH_GUARD_BASE_MS = 15_000L;
+    private static final long SPEECH_GUARD_PER_CHAR_MS = 400L;
+
+    /** 自适应轮询阶梯：连续零补获时逐级退避；第 0 档等于用户档位与 5 秒中较慢的那个。 */
+    private static final long[] POLL_LADDER_MS = {5_000L, 15_000L, 30_000L, 60_000L};
+    private static final String[] POLL_TIER_NAMES = {"5 秒", "15 秒", "30 秒", "60 秒"};
+    /**
+     * 进入下一档所需的连续「零补获」轮询次数。按最快档 5 秒折算：
+     * 12 次 ≈ 1 分钟、30 次 ≈ 4 分钟、60 次 ≈ 10 分钟。
+     */
+    private static final int[] POLL_LADDER_STEPS = {12, 30, 60};
+    /**
+     * 补获年龄门：轮询看到某条通知时，它至少已经存在这么久，才算「系统回调漏投」。
+     * 回调被主线程堵住几百毫秒、随后才到，属于竞态而不是故障；
+     * 少了这道门，一次假补获就能把阶梯打回最快档。
+     */
+    private static final long POLL_CATCH_MIN_AGE_MS = 2_000L;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Handler pollHandler = new Handler(Looper.getMainLooper());
@@ -55,13 +82,31 @@ public class NotificationReaderService extends NotificationListenerService {
                 Log.e(TAG, "poll tick failed", throwable);
             } finally {
                 if (!destroyed) {
+                    // 档位变了就留一条记录，方便事后对上「那段时间为什么省电 / 为什么播报变慢」。
+                    if (isAdaptivePollEnabled()) {
+                        int tier = pollTier();
+                        if (tier != lastRecordedTier) {
+                            lastRecordedTier = tier;
+                            recordEvent("轮询档位 → " + POLL_TIER_NAMES[tier]
+                                    + "（连续零补获 " + emptyPollStreak + " 次）");
+                        }
+                    }
                     pollHandler.postDelayed(this, pollInterval());
                 }
             }
         }
     };
 
-    /** 轮询间隔可在设置里调整，默认 5 秒（1–30 秒可选）。 */
+    /**
+     * 轮询间隔可在设置里调整，默认 5 秒（1–30 秒可选）。
+     *
+     * 判据的演进（改动动机就写在这，免得以后又被"看回调时间戳"这种直觉骗回去）：
+     * 旧实现拿「最近 2 分钟有没有收到系统回调」当通道健康度。可回调只在有通知时才来，
+     * 安静时段时间戳必然陈旧，于是被判成"通道可疑"，整夜 5 秒一轮——
+     * 恰恰是没事发生、最该省电的时候最费电。
+     * 现在改用「这一轮到底有没有补到东西」：补到说明回调漏投，立刻回最快档；
+     * 连续补不到说明只是没事发生，逐级退避。沉默不再被当成故障证据。
+     */
     private long pollInterval() {
         int value = getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE)
                 .getInt(MainActivity.KEY_POLL_INTERVAL, MainActivity.DEFAULT_POLL_INTERVAL_MS);
@@ -71,13 +116,77 @@ public class NotificationReaderService extends NotificationListenerService {
         if (value > 30000) {
             value = 30000;
         }
-        // 自适应：如果最近 2 分钟收到过系统回调，说明推送通道是通的
-        // （例如有外部守护脚本防止了进程冻结），此时轮询只当兜底，大幅降频省电。
-        long sinceCallback = SystemClock.elapsedRealtime() - lastCallbackMs;
-        if (lastCallbackMs > 0 && sinceCallback < 120_000L) {
-            return Math.max(value, 15_000L);
+        if (!isAdaptivePollEnabled()) {
+            // 自适应关掉：严格照用户档位，设置值就是最终值，不做静默改写。
+            return value;
         }
-        return value;
+        if (!listenerBound) {
+            // 硬信号：监听器没绑上，回调一定收不到，轮询是唯一通道，按允许的最快档跑。
+            return Math.min(value, POLL_LADDER_MS[0]);
+        }
+        return Math.max(value, POLL_LADDER_MS[pollTier()]);
+    }
+
+    /** 供 KeepAliveService 判断绑定状态；不再用 getInstance()==null 这种近似。 */
+    static boolean isListenerBound() {
+        return listenerBound;
+    }
+
+    /** 当前退避档位：0=最快，3=最慢。 */
+    private int pollTier() {
+        if (emptyPollStreak < POLL_LADDER_STEPS[0]) {
+            return 0;
+        }
+        if (emptyPollStreak < POLL_LADDER_STEPS[1]) {
+            return 1;
+        }
+        if (emptyPollStreak < POLL_LADDER_STEPS[2]) {
+            return 2;
+        }
+        // 60 秒档只给灭屏：亮屏说明人可能正盯着通知，
+        // 真漏投时让消息晚一分钟到，比省这点电代价大。
+        return isScreenOff() ? 3 : 2;
+    }
+
+    private boolean isAdaptivePollEnabled() {
+        return getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE)
+                .getBoolean(MainActivity.KEY_ADAPTIVE_POLL, true);
+    }
+
+    private boolean isScreenOff() {
+        android.os.PowerManager powerManager =
+                (android.os.PowerManager) getSystemService(POWER_SERVICE);
+        return powerManager != null && !powerManager.isInteractive();
+    }
+
+    /** 一行说明当前间隔的来历，给「为什么不播 / 为什么费电」这类问题用。 */
+    private String describePollStrategy() {
+        if (!isAdaptivePollEnabled()) {
+            return "固定档位";
+        }
+        if (!listenerBound) {
+            return "监听未连接，强制最快档";
+        }
+        if (emptyPollStreak < POLL_LADDER_STEPS[0]) {
+            return "刚补获过或刚起轮，最快档";
+        }
+        return "连续零补获 " + emptyPollStreak + " 次，第 " + (pollTier() + 1) + " 档";
+    }
+
+    /** 设置页改完档位后立刻按新间隔重排下一次 tick，不用等当前这一轮跑完。 */
+    static void refreshPollCadence() {
+        NotificationReaderService service = instance;
+        if (service == null || service.destroyed) {
+            return;
+        }
+        service.pollHandler.post(() -> {
+            if (service.destroyed || !service.pollingActive) {
+                return;
+            }
+            service.lastRecordedTier = -1;
+            service.pollHandler.removeCallbacks(service.pollRunnable);
+            service.pollHandler.postDelayed(service.pollRunnable, service.pollInterval());
+        });
     }
 
     /**
@@ -133,6 +242,10 @@ public class NotificationReaderService extends NotificationListenerService {
         pollHandler.removeCallbacks(pollRunnable);
         pollingActive = false;
         resetPollingState();
+        // 退避状态一起复位：耳机断开期间没有任何判据在跑，
+        // 留着旧计数会让重新连上后的头几轮还挂在慢档上。
+        emptyPollStreak = 0;
+        lastRecordedTier = -1;
         writeHeartbeat();
         if (!destroyed) {
             pollHandler.removeCallbacks(idleHeartbeatRunnable);
@@ -178,11 +291,67 @@ public class NotificationReaderService extends NotificationListenerService {
     private int ttsInitRetries;
     private static final int MAX_TTS_INIT_RETRIES = 3;
     private int savedMusicVolume = -1;
-    /** 正在播报中的 utteranceId。用集合而非计数，避免 TTS 同时回调 onDone/onStop 把计数减成负数。 */
-    private final Set<String> activeUtterances = new HashSet<>();
-    /** 音量提升后的兜底恢复：无论回调是否到达，超时一定恢复原音量。 */
-    /** 超时守卫：固定引用才能 removeCallbacks。 */
-    private final Runnable utteranceTimeoutGuard = this::onUtteranceTimeoutGuard;
+    /**
+     * 播报状态机。
+     *
+     * 原来这套逻辑是 11 条补丁叠在 speaking / paused / currentItem / guard / volume /
+     * focus 六个独立字段上：任何一个出口忘了置位，结果就是「音频焦点和抬高后的音量
+     * 一直挂着」。收成枚举之后所有出口都必须走 endSpeechSession()，漏一处会明显不一致。
+     */
+    private enum SpeechPhase { IDLE, SPEAKING, PAUSED }
+    private SpeechPhase speechPhase = SpeechPhase.IDLE;
+    /** 引擎正在念的那一条的 token；null 表示没有在念。对不上的回调一律丢弃。 */
+    private String activeToken;
+    /** 会话序号与条目序号：让被冻结期间排队、解冻后集中爆发的旧回调自然失效。 */
+    private long sessionSeq;
+    private long itemSeq;
+    /** 连续 speak() 失败次数：连续失败意味着引擎坏了，要重建而不是无限重试。 */
+    private int speakFailStreak;
+    /** 引擎代数：每次重建 +1，写进 token，让旧引擎迟到的回调一定会对不上。 */
+    private int engineEpoch;
+    private static final int MAX_SPEAK_RETRIES = 2;
+    /**
+     * 连续失败到这个数就重建引擎。必须小于「重试上限 + 1」，否则重建总是发生在
+     * 该条已经被放弃之后，那条通知永远享受不到新引擎（上限 2 = 每条 3 次机会，
+     * 阈值取 2 才能让最后一次尝试落在新引擎上）。
+     */
+    private static final int MAX_SPEAK_FAIL_STREAK = 2;
+    /** 启动守卫：speak() 返回 SUCCESS 但引擎迟迟不开口时最多等这么久。 */
+    private static final long START_GUARD_MS = 5_000L;
+    /** onDone 之后等 A2DP 管线把尾音放完再还原音量，否则最后半句会被削掉。 */
+    private static final long VOLUME_RESTORE_DELAY_MS = 400L;
+    /**
+     * 正在念的那一条。焦点被短暂抢占时 textToSpeech.stop() 会把它掐断，
+     * 而它在 isNewNotification 里已被标记「已播报」——不回队就是永久丢失。
+     */
+    private PendingAnnouncement currentItem;
+    /** 守卫拆两段：开口前的启动守卫 + 开口后按字数估的完成守卫。 */
+    private final Runnable startGuard = this::onStartGuardTimeout;
+    private final Runnable finishGuard = this::onFinishGuardTimeout;
+    /** 本次会话提升到的目标音量；-1 表示没提升过。落盘续租要用它。 */
+    private int boostedMusicVolume = -1;
+    /** 守卫的计划触发时刻：实际触发晚太多说明线程被冻过，是假超时。 */
+    private long startGuardDueMs;
+    private long finishGuardDueMs;
+    /** 假超时只宽限一次，否则真卡死时会一直宽限下去。 */
+    private boolean startGuardGraced;
+    private boolean finishGuardGraced;
+    /** 引擎重建的窗口与次数：反复坏掉时不能无限重建。 */
+    private long rebuildWindowStartMs;
+    private int rebuildCount;
+    private static final int MAX_REBUILD_PER_WINDOW = 6;
+    private static final long REBUILD_WINDOW_MS = 3600_000L;
+    /**
+     * 音量还原的延迟执行体。
+     * 迟到执行时若已经有新会话在念，必须放手：否则它会把新会话刚提上去的音量
+     * 和刚写好的落盘记录一起抹掉。
+     */
+    private final Runnable pendingVolumeRestore = () -> {
+        if (speechPhase == SpeechPhase.SPEAKING) {
+            return;
+        }
+        restoreVolumeAfterSpeech();
+    };
     private final Runnable volumeSafetyRestore = new Runnable() {
         @Override
         public void run() {
@@ -247,6 +416,17 @@ public class NotificationReaderService extends NotificationListenerService {
 
     static boolean isServiceRunning() {
         return instance != null;
+    }
+
+    /**
+     * 本进程此刻是否处在「播报会话」里：保活服务据此判断「能不能动音量」。
+     *
+     * 注意 PAUSED 也算：暂停时音量故意保持在提升值上（否则恢复续播会掉一下声音），
+     * 这时候把它当成「没在播报」去还原，就会在来电结束后以原音量开口。
+     */
+    static boolean isSpeakingNow() {
+        NotificationReaderService service = instance;
+        return service != null && service.speechPhase != SpeechPhase.IDLE;
     }
 
     /** 记录通知是怎么进来的：系统回调 / 轮询补拉。用来区分"没收到"和"收到没播"。 */
@@ -354,15 +534,25 @@ public class NotificationReaderService extends NotificationListenerService {
         StringBuilder builder = new StringBuilder();
         builder.append("· TTS：").append(service.ttsReady ? "就绪" : "未就绪").append('\n');
         builder.append("· 待播队列：").append(service.pendingAnnouncements.size())
-                .append(" 条，播放中：").append(service.activeUtterances.size()).append(" 条\n");
+                .append(" 条，播放中：")
+                .append(service.speechPhase == SpeechPhase.SPEAKING ? 1 : 0).append(" 条\n");
         long sinceTick = service.lastPollTickMs <= 0L
                 ? -1L
                 : SystemClock.elapsedRealtime() - service.lastPollTickMs;
         builder.append("· 轮询：").append(service.pollingActive
-                        ? ("运行中，间隔 " + (service.pollInterval() / 1000f) + " 秒")
+                        ? ("运行中，间隔 " + (service.pollInterval() / 1000f) + " 秒（"
+                                + service.describePollStrategy() + "）")
                         : "已暂停（未连接耳机）")
                 .append(sinceTick < 0 ? "，尚未跑过" : "，上次 tick " + (sinceTick / 1000L) + " 秒前")
                 .append('\n');
+        if (service.pollingActive) {
+            builder.append("· 补获：连续 ").append(service.emptyPollStreak)
+                    .append(" 次轮询没补到东西（满 ").append(POLL_LADDER_STEPS[0])
+                    .append(" 次退 ").append(POLL_TIER_NAMES[1])
+                    .append("，满 ").append(POLL_LADDER_STEPS[1]).append(" 次退 ")
+                    .append(POLL_TIER_NAMES[2]).append("，满 ").append(POLL_LADDER_STEPS[2])
+                    .append(" 次且灭屏退 ").append(POLL_TIER_NAMES[3]).append("）\n");
+        }
         builder.append("· 最近系统回调：")
                 .append(sinceCallback < 0 ? "尚未收到" : (sinceCallback / 1000L) + " 秒前")
                 .append('\n');
@@ -380,6 +570,16 @@ public class NotificationReaderService extends NotificationListenerService {
     }
     private static volatile NotificationReaderService instance;
     private boolean pollInitialized;
+    /**
+     * 监听器当前是否已绑定：绑不上就是「回调一定收不到」的硬信号。
+     * static 是因为 KeepAliveService 要在「服务实例可能为 null」的时候判断它——
+     * 用 getInstance()==null 当代替品会漏掉「对象还在、绑定已断」的状态（实测盲窗 5 分钟）。
+     */
+    private static volatile boolean listenerBound;
+    /** 连续「零补获」的轮询次数，自适应退避的唯一判据。 */
+    private int emptyPollStreak;
+    /** 上次记录的档位，只在变化时写事件，避免把最近处理记录刷满。 */
+    private int lastRecordedTier = -1;
     private long lastPollLogMs;
     private long lastCallbackMs;
     private long lastBluetoothCheckMs;
@@ -407,7 +607,9 @@ public class NotificationReaderService extends NotificationListenerService {
                 Log.i(TAG, "Bluetooth audio output removed; clearing queue and stopping speech.");
                 recordEvent("蓝牙音频已断开（队列已清空）");
                 pendingAnnouncements.clear();
-                activeUtterances.clear();
+                activeToken = null;
+                currentItem = null;
+                speechPhase = SpeechPhase.IDLE;
                 if (textToSpeech != null) {
                     textToSpeech.stop();
                     // 拔了耳机就没人听：把引擎整个放掉，否则它会一直 bind 在本进程里
@@ -511,6 +713,16 @@ public class NotificationReaderService extends NotificationListenerService {
                 .remove("listener_down_since_ms")
                 .apply();
         recordEvent("监听已连接");
+        // 绑定成功是「回调通道通」的硬证据：补获计数清零，回到最快档。
+        listenerBound = true;
+        emptyPollStreak = 0;
+        lastRecordedTier = -1;
+        // 上一次切换绑定的窗口标记到这里才算真正收尾：权限已在，标记只是没删干净。
+        ListenerHeal.clearInflight(this);
+        // 切换窗口里到达的通知既不进回调（那时没绑定）也可能已被轮询跳过，
+        // 这里补一次即时的：syncPollingWithBluetooth 会把轮询拉回 1 秒档并立刻跑一轮。
+        // 顺手把「上次提了音量没还原」的残留收掉 —— 进程刚起来时这件事最该做。
+        SpeechVolumeGuard.recoverIfNeeded(this, false);
         ensureKeepAliveIfNeeded();
         // 重新绑定后按当前条件恢复轮询，避免被系统解绑再绑定时轮询已停。
         syncPollingWithBluetooth();
@@ -521,6 +733,14 @@ public class NotificationReaderService extends NotificationListenerService {
         super.onListenerDisconnected();
         Log.w(TAG, "onListenerDisconnected: rebinding.");
         recordEvent("监听已断开，2 秒后尝试重绑");
+        // 绑定断了是硬故障：回调一定不会来，补获计数清零并立刻切最快档，
+        // 不能等「12 次零补获」的自然退避规则再走一遍。
+        listenerBound = false;
+        emptyPollStreak = 0;
+        lastRecordedTier = -1;
+        if (!destroyed) {
+            startPolling(1000L);
+        }
         // 系统解绑后（后台限制、进程降级等），主动请求重新绑定。
         if (!destroyed) {
             mainHandler.postDelayed(() -> {
@@ -735,6 +955,10 @@ public class NotificationReaderService extends NotificationListenerService {
         // 注意不能用 postTime 单独判断：微信/QQ 复用同一通知时 postTime 可能不变，
         // 但正文已经更新，只看时间会漏播，所以指纹里必须带上文本内容。
         Set<String> aliveKeys = new HashSet<>();
+        boolean caughtByPoll = false;
+        // 年龄门用墙上时钟：postTime 是 System.currentTimeMillis()，
+        // 跟 elapsedRealtime() 不是同一基准，两个相减会得出荒谬的年龄。
+        long nowWallMs = System.currentTimeMillis();
         for (StatusBarNotification statusBarNotification : active) {
             String key = statusBarNotification.getKey();
             aliveKeys.add(key);
@@ -743,32 +967,59 @@ public class NotificationReaderService extends NotificationListenerService {
             if (fingerprint != null && fingerprint.equals(lastFingerprint)) {
                 continue;
             }
+            if (nowWallMs - statusBarNotification.getPostTime() >= POLL_CATCH_MIN_AGE_MS) {
+                caughtByPoll = true;
+            }
             try {
                 recordArrival(statusBarNotification.getPackageName(), "轮询补获");
                 handleNotificationPosted(statusBarNotification);
             } catch (RuntimeException exception) {
                 Log.e(TAG, "Poll handling failed", exception);
-            }        }
+            }
+        }
+        // 只有这一个判据：这一轮有没有补到「本该由回调送来」的东西。
+        // 补到了 → 回调不可靠，立刻回最快档；没补到 → 只是没事发生，继续累计退避。
+        if (caughtByPoll) {
+            if (emptyPollStreak >= POLL_LADDER_STEPS[0]) {
+                recordEvent("轮询补获漏投内容，退避复位（此前连续零补获 " + emptyPollStreak + " 次）");
+            }
+            emptyPollStreak = 0;
+        } else {
+            emptyPollStreak = Math.min(emptyPollStreak + 1, 10_000);
+        }
         lastFingerprints.keySet().retainAll(aliveKeys);
     }
 
     /**
-     * 轻量指纹：只取时间戳和标题/正文原文，不做包名解析等跨进程操作。
+     * 轻量指纹：时间戳 + 三段文本的 32 位哈希，不做包名解析等跨进程操作。
      * 内容任何一处变化都会让指纹不同，从而不会漏播。
+     *
+     * 存哈希而不是原文：这个函数每个 tick 要对所有活动通知跑一遍，
+     * handleNotificationPosted 里还会再算一次；拼长字符串的分配开销在
+     * 进度条类通知（每秒刷新）上最明显。三段各取一个 32 位哈希再加 postTime，
+     * 误判概率可以忽略，而分配量从"整段正文"降到"几个短串"。
      */
     private String buildFingerprint(StatusBarNotification statusBarNotification) {
         Bundle extras = statusBarNotification.getNotification().extras;
         if (extras == null) {
             return String.valueOf(statusBarNotification.getPostTime());
         }
-        String title = asString(extras.getCharSequence(Notification.EXTRA_TITLE));
-        String text = asString(extras.getCharSequence(Notification.EXTRA_TEXT));
-        String bigText = asString(extras.getCharSequence(Notification.EXTRA_BIG_TEXT));
-        return statusBarNotification.getPostTime() + "|" + title + "|" + text + "|" + bigText;
+        return statusBarNotification.getPostTime()
+                + "|" + hashOf(extras.getCharSequence(Notification.EXTRA_TITLE))
+                + "|" + hashOf(extras.getCharSequence(Notification.EXTRA_TEXT))
+                + "|" + hashOf(extras.getCharSequence(Notification.EXTRA_BIG_TEXT));
     }
 
-    private String asString(CharSequence value) {
-        return value == null ? "" : value.toString();
+    /**
+     * 必须先 toString() 再 hashCode()：extras 里常见 SpannableString，
+     * 它的 hashCode 继承自 Object（按实例算），直接取会让同一条内容每轮都被判成"变了"，
+     * 那就变成了每次轮询都重复播报。
+     */
+    private String hashOf(CharSequence value) {
+        if (value == null) {
+            return "-";
+        }
+        return Integer.toHexString(value.toString().hashCode());
     }
 
     @Override
@@ -858,7 +1109,8 @@ public class NotificationReaderService extends NotificationListenerService {
             recordSkip(packageName, "内容已播报过");
             return;
         }
-        enqueueAnnouncement(statusBarNotification.getKey(), announcement);
+        enqueueAnnouncement(statusBarNotification.getKey(), announcement,
+                statusBarNotification.getPostTime());
         drainAnnouncementQueue();
     }
 
@@ -868,14 +1120,23 @@ public class NotificationReaderService extends NotificationListenerService {
      * 2. 超过 30 秒的内容直接丢弃，不念过期消息
      * 3. 队列超过上限时挤掉最早的
      */
-    private void enqueueAnnouncement(String key, String text) {
+    private void enqueueAnnouncement(String key, String text, long postTime) {
         long now = SystemClock.elapsedRealtime();
+        // 进程被冻结时，通知回调会排队到解冻后才送达。这时 enqueuedAt 只是
+        // 「刚收到」的时刻，而通知本身可能已经是十分钟前的了——验证码、导航、
+        // 聊天都会被念成过时信息。用系统的 postTime 判断真实新鲜度。
+        long wallAge = postTime > 0 ? System.currentTimeMillis() - postTime : 0L;
+        if (wallAge > MAX_QUEUE_AGE_MS) {
+            Log.i(TAG, "drop stale notification, postTime age=" + (wallAge / 1000L) + "s");
+            recordEvent("跳过 " + (wallAge / 1000L) + " 秒前的旧通知");
+            return;
+        }
         pendingAnnouncements.removeIf(item -> item.key.equals(key));
         pendingAnnouncements.removeIf(item -> now - item.queuedAt > MAX_QUEUE_AGE_MS);
         while (pendingAnnouncements.size() >= MAX_PENDING_ANNOUNCEMENTS) {
             pendingAnnouncements.removeFirst();
         }
-        pendingAnnouncements.addLast(new PendingAnnouncement(key, text, now));
+        pendingAnnouncements.addLast(new PendingAnnouncement(key, text, now, now, postTime));
         Log.i(TAG, "queued: " + text);
         recordEvent("入队播报：" + (text.length() > 40 ? text.substring(0, 40) + "…" : text));
     }
@@ -912,10 +1173,25 @@ public class NotificationReaderService extends NotificationListenerService {
     /**
      * 播报前临时把媒体音量提到用户设定的水平，播完恢复原值。
      * 只在目标音量高于当前音量时才提升，不会主动压低用户音量。
+     *
+     * 原值必须同时落盘（{@link SpeechVolumeGuard}）：本 ROM 会把本进程冻进 freezer，
+     * app 内的恢复定时器跟着停摆，只有磁盘上的记录能让重启后的自己、保活服务和
+     * root 守护把这件事收尾。
      */
     private void boostVolumeForSpeech() {
-        if (audioManager == null || savedMusicVolume >= 0) {
+        if (audioManager == null) {
             return;
+        }
+        if (savedMusicVolume >= 0) {
+            // 内存里还记着「提过音量」，但磁盘记录可能已经被外部（保活服务、
+            // root 守护）按过期租约还原并删掉了。这时继续跳过 boost，整段会话
+            // 都会在没提升过的音量里念完——所以要先核对磁盘。
+            if (SpeechVolumeGuard.isPresent(this)) {
+                return;
+            }
+            Log.i(TAG, "volume marker gone, re-boosting for this session.");
+            savedMusicVolume = -1;
+            boostedMusicVolume = -1;
         }
         SharedPreferences preferences =
                 getSharedPreferences(MainActivity.PREFERENCES_NAME, MODE_PRIVATE);
@@ -930,27 +1206,114 @@ public class NotificationReaderService extends NotificationListenerService {
         if (target > current) {
             try {
                 savedMusicVolume = current;
+                boostedMusicVolume = target;
+                // 先落盘再改音量：顺序反过来的话，改完立刻被冻住就一份记录都不剩
+                SpeechVolumeGuard.record(this, current, target, max,
+                        System.currentTimeMillis() + VOLUME_SAFETY_TIMEOUT_MS);
                 audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
-                mainHandler.removeCallbacks(volumeSafetyRestore);
-                mainHandler.postDelayed(volumeSafetyRestore, VOLUME_SAFETY_TIMEOUT_MS);
+                armVolumeSafetyRestore();
                 Log.i(TAG, "volume boosted " + current + " -> " + target + " (max " + max + ")");
             } catch (RuntimeException exception) {
                 savedMusicVolume = -1;
+                SpeechVolumeGuard.clear(this);
                 Log.w(TAG, "volume boost failed", exception);
             }
         }
     }
 
+    /**
+     * 每条 utterance 都重新武装兜底恢复，并顺延磁盘标记的 mtime。
+     * 串行投递期间 savedMusicVolume 一直保持高位不再重置，只在会话开头武装一次的话，
+     * 一个念得慢的长队列会在 2 分钟处被兜底降回原音量，后面几条就在小声里念完。
+     */
+    private void armVolumeSafetyRestore() {
+        mainHandler.removeCallbacks(volumeSafetyRestore);
+        mainHandler.postDelayed(volumeSafetyRestore, VOLUME_SAFETY_TIMEOUT_MS);
+        if (savedMusicVolume < 0 || audioManager == null) {
+            return;
+        }
+        // 续租：文件在整个会话期间都存在，只看「文件在」就恢复的话，
+        // 守护会在念到一半时把音量压回去。每次开口都把租约往后推。
+        SpeechVolumeGuard.refresh(this, savedMusicVolume, boostedMusicVolume,
+                audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
+                System.currentTimeMillis() + VOLUME_SAFETY_TIMEOUT_MS);
+    }
+
+    /** 启动守卫：speak() 返回 SUCCESS 之后，引擎必须尽快回调 onStart。 */
+    private void armStartGuard() {
+        mainHandler.removeCallbacks(finishGuard);
+        mainHandler.removeCallbacks(startGuard);
+        startGuardDueMs = SystemClock.elapsedRealtime() + START_GUARD_MS;
+        startGuardGraced = false;
+        mainHandler.postDelayed(startGuard, START_GUARD_MS);
+    }
+
+    /** 完成守卫：onStart 之后按字数估算，封顶 UTTERANCE_TIMEOUT_MS。 */
+    private void armFinishGuard() {
+        mainHandler.removeCallbacks(startGuard);
+        mainHandler.removeCallbacks(finishGuard);
+        long chars = currentItem == null ? 0L : currentItem.text.length();
+        long guard = SPEECH_GUARD_BASE_MS + SPEECH_GUARD_PER_CHAR_MS * chars;
+        guard = Math.min(guard, UTTERANCE_TIMEOUT_MS);
+        finishGuardDueMs = SystemClock.elapsedRealtime() + guard;
+        finishGuardGraced = false;
+        mainHandler.postDelayed(finishGuard, guard);
+    }
+
+    private void cancelGuards() {
+        mainHandler.removeCallbacks(startGuard);
+        mainHandler.removeCallbacks(finishGuard);
+    }
+
+    /**
+     * 焦点被短暂抢占时把队列的年龄基准推后，但**必须有上限**。
+     *
+     * 无上限的顺延等于废掉新鲜度：一个 40 分钟的电话结束后，会把 40 分钟前的通知
+     * 一条条念出来。这里只允许相对「原始进队时刻」顺延 60 秒，超过就让它自然过期。
+     */
+    private void deferQueueAge() {
+        long now = SystemClock.elapsedRealtime();
+        for (PendingAnnouncement item : pendingAnnouncements) {
+            long cap = item.enqueuedAt + QUEUE_AGE_DEFER_MAX_MS;
+            item.queuedAt = Math.min(now, cap);
+        }
+    }
+
+    private static final long QUEUE_AGE_DEFER_MAX_MS = 60_000L;
+
+    /**
+     * 延迟 400ms 再还原：A2DP 管线有 200~300ms 延迟，部分引擎的 onDone 表示
+     * 「合成结束」而不是「播放结束」，立刻还原会把最后半句压在低位里。
+     */
+    private void scheduleVolumeRestore() {
+        mainHandler.removeCallbacks(pendingVolumeRestore);
+        mainHandler.postDelayed(pendingVolumeRestore, VOLUME_RESTORE_DELAY_MS);
+    }
+
+    private void cancelPendingVolumeRestore() {
+        mainHandler.removeCallbacks(pendingVolumeRestore);
+    }
+
     private void restoreVolumeAfterSpeech() {
         mainHandler.removeCallbacks(volumeSafetyRestore);
-        if (savedMusicVolume >= 0 && audioManager != null) {
+        int original = savedMusicVolume;
+        savedMusicVolume = -1;
+        boostedMusicVolume = -1;
+        if (original < 0) {
+            // 本轮根本没提过音量：磁盘上那份记录不属于本进程，不能在这里删。
+            // 之前无条件 clear 会踩掉「另一个正在播报的会话」的租约，
+            // 让对方的音量在念到一半时被兜底逻辑压回原值。
+            return;
+        }
+        // 只有确实还原了才删记录，否则下次启动会被当成「上次没还原」再改一次音量
+        SpeechVolumeGuard.clear(this);
+        if (audioManager != null) {
             try {
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedMusicVolume, 0);
-                Log.i(TAG, "volume restored to " + savedMusicVolume);
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, original, 0);
+                Log.i(TAG, "volume restored to " + original);
             } catch (RuntimeException exception) {
                 Log.w(TAG, "volume restore failed", exception);
             }
-            savedMusicVolume = -1;
         }
     }
 
@@ -990,6 +1353,11 @@ public class NotificationReaderService extends NotificationListenerService {
             instance = null;
         }
         pendingAnnouncements.clear();
+        activeToken = null;
+        currentItem = null;
+        speechPhase = SpeechPhase.IDLE;
+        cancelGuards();
+        cancelPendingVolumeRestore();
         abandonAudioFocus();
         restoreVolumeAfterSpeech();
         if (audioManager != null) {
@@ -1043,29 +1411,33 @@ public class NotificationReaderService extends NotificationListenerService {
             @Override
             public void onStart(String utteranceId) {
                 Log.i(TAG, "TTS onStart " + utteranceId);
-                // 守卫改从「真正开播」计时：QUEUE_ADD 排队的第 3、4 条如果按
-                // speak() 调用时刻算，60 秒守卫会在它们念完前误触发，
-                // 提前放弃焦点并把音量降回去，听感就是「声音忽大忽小」。
-                mainHandler.removeCallbacks(utteranceTimeoutGuard);
-                mainHandler.postDelayed(utteranceTimeoutGuard, UTTERANCE_TIMEOUT_MS);
+                // 引擎真正开口了：启动守卫换成按字数估的完成守卫。
+                // 全部 post 到同一个 Handler：回调来自 binder 线程，冻结解冻后会集中
+                // 爆发，必须串行化，否则状态迁移互相踩。
+                mainHandler.post(() -> {
+                    if (!utteranceId.equals(activeToken)) {
+                        return;
+                    }
+                    armFinishGuard();
+                });
             }
 
             @Override
             public void onDone(String utteranceId) {
                 Log.i(TAG, "TTS onDone " + utteranceId);
-                mainHandler.post(() -> onUtteranceFinished(utteranceId));
+                mainHandler.post(() -> onUtteranceFinished(utteranceId, false));
             }
 
             @Override
             public void onError(String utteranceId) {
                 Log.e(TAG, "TTS onError " + utteranceId);
-                mainHandler.post(() -> onUtteranceFinished(utteranceId));
+                mainHandler.post(() -> onUtteranceFinished(utteranceId, true));
             }
 
             @Override
             public void onStop(String utteranceId, boolean interrupted) {
                 Log.i(TAG, "TTS onStop " + utteranceId + " interrupted=" + interrupted);
-                mainHandler.post(() -> onUtteranceFinished(utteranceId));
+                mainHandler.post(() -> onUtteranceFinished(utteranceId, false));
             }
         });
     }
@@ -1136,30 +1508,48 @@ public class NotificationReaderService extends NotificationListenerService {
      * 只写 SharedPreferences 是不够的：队列里最多还压着 5 条，引擎里还有已排队
      * 的 utterance，它们会继续念几十秒，表现就是「关了还在念」。
      */
+    /**
+     * 用户关掉播报（App 内开关或快捷磁贴）时必须立刻停下。
+     * 只写 SharedPreferences 是不够的：队列里最多还压着 5 条，引擎里还有已排队的
+     * utterance，它们会继续念几十秒，表现就是「关了还在念」。
+     */
     static void stopEverything(Context context) {
         NotificationReaderService service = instance;
         if (service == null) {
             return;
         }
         service.mainHandler.post(() -> {
-            if (service.pendingAnnouncements.isEmpty() && service.activeUtterances.isEmpty()
+            if (service.pendingAnnouncements.isEmpty()
+                    && service.speechPhase == SpeechPhase.IDLE
                     && service.savedMusicVolume < 0) {
                 // 已经在关着的空档：onResume 每次都调过来，别反复 stop 引擎刷日志
                 return;
             }
+            service.endSpeechSessionNow();
             service.pendingAnnouncements.clear();
-            service.activeUtterances.clear();
             if (service.textToSpeech != null) {
+                // 先断会话（activeToken 置空）再 stop：stop() 之后引擎补发的
+                // onDone/onStop 会因为 token 对不上被丢掉，不会推进到下一轮投递。
                 service.textToSpeech.stop();
             }
-            service.abandonAudioFocus();
-            service.restoreVolumeAfterSpeech();
             recordEvent("播报已关闭，队列与引擎队列一并清空");
         });
     }
 
+    /**
+     * 逐条投递：一次只把一条交给引擎，念完的回调里再取队首。
+     * 旧实现用一个 while 循环把整队 QUEUE_ADD 塞进引擎，于是
+     * 「过期不念」「同 key 只留最新」全部失效——已经进了引擎队列的内容撤不回来；
+     * 焦点一丢 stop() 就被清空，注释承诺的「队列留着稍后重试」并不成立。
+     */
     private void drainAnnouncementQueue() {
+        if (speechPhase != SpeechPhase.IDLE) {
+            // SPEAKING：当前这条还没念完，等回调；PAUSED：焦点被占着，
+            // 这时候投递等于在人家说话时插嘴，而且会把暂停态又推回 SPEAKING。
+            return;
+        }
         if (pendingAnnouncements.isEmpty()) {
+            endSpeechSession();
             return;
         }
         // 兜底：任何延迟重试（焦点、朗读失败）都不该在开关关闭后再把内容念出来
@@ -1167,6 +1557,7 @@ public class NotificationReaderService extends NotificationListenerService {
                 .getBoolean(MainActivity.KEY_ENABLED, true)) {
             Log.i(TAG, "drain: announcements disabled, dropping queue.");
             pendingAnnouncements.clear();
+            endSpeechSession();
             return;
         }
         // 用 1 秒缓存的蓝牙状态即可：hasBluetoothAudioOutput 每次都跨 binder 查
@@ -1174,83 +1565,225 @@ public class NotificationReaderService extends NotificationListenerService {
         if (!isBluetoothConnected()) {
             Log.i(TAG, "drain: no bluetooth audio output, dropping queue.");
             pendingAnnouncements.clear();
+            endSpeechSession();
             return;
         }
         if (!ttsReady) {
             Log.i(TAG, "drain: TTS not ready yet, keeping queue.");
+            endSpeechSession();
             return;
         }
+        long now = SystemClock.elapsedRealtime();
+        collapseStaleIntoSummary(now);
         while (!pendingAnnouncements.isEmpty()) {
             PendingAnnouncement item = pendingAnnouncements.removeFirst();
-            if (SystemClock.elapsedRealtime() - item.queuedAt > MAX_QUEUE_AGE_MS) {
+            int dropped = 0;
+            if (now - item.queuedAt > MAX_QUEUE_AGE_MS) {
                 Log.i(TAG, "drop stale announcement");
+                dropped = 1;
+            }
+            reportDropped(dropped);
+            // 投出去就收手，剩下是 onUtteranceFinished 的事；
+            // speak 失败时它已把这条放回队首并安排了重试。
+            if (speak(item)) {
+                return;
+            }
+            // 失败且这条已过期被丢弃时队列会是空的：会话必须收掉，
+            // 否则焦点和提升后的音量一直挂着。
+            if (pendingAnnouncements.isEmpty()) {
+                endSpeechSession();
+            }
+            return;
+        }
+        // 走到这里说明队列真的空了：过期条目已经在 collapseStaleIntoSummary
+        // 里合并成一条摘要并投递过了，不该再静默丢弃。
+        endSpeechSession();
+    }
+
+    /**
+     * 把这一轮扫到的过期条目合并成一条摘要，而不是静默丢掉。
+     *
+     * 静默丢弃对使用者最难受：他只知道「刚才好像响过一条通知」，事后完全无法回忆。
+     * 合并成一条「已跳过 n 条未播报的通知」至少给出计数。摘要本身不参与再合并，
+     * 新摘要替换旧摘要并累加计数，避免出现「摘要的摘要」。
+     */
+    private void collapseStaleIntoSummary(long now) {
+        int stale = 0;
+        java.util.Iterator<PendingAnnouncement> iterator = pendingAnnouncements.iterator();
+        while (iterator.hasNext()) {
+            PendingAnnouncement item = iterator.next();
+            if (item.summary) {
                 continue;
             }
-            if (!speak(item)) {
-                // 播报没发出去（音频焦点被占用），speak 已把这条放回队首，
-                // 必须停下这轮循环，否则 while 会反复取到同一条而死循环。
+            // 两条判据都要看：queuedAt 管「入队后放了多久」，postTime 管
+            // 「通知本身生成多久了」——后者才能识别冻结期间积压的旧回调。
+            boolean expired = now - item.queuedAt > MAX_QUEUE_AGE_MS;
+            if (!expired && item.postTime > 0) {
+                expired = System.currentTimeMillis() - item.postTime > MAX_QUEUE_AGE_MS;
+            }
+            if (expired) {
+                iterator.remove();
+                stale++;
+            }
+        }
+        if (stale == 0) {
+            return;
+        }
+        java.util.Iterator<PendingAnnouncement> previous = pendingAnnouncements.iterator();
+        while (previous.hasNext()) {
+            PendingAnnouncement item = previous.next();
+            if (item.summary) {
+                stale += item.summaryCount;
+                previous.remove();
                 break;
             }
         }
+        PendingAnnouncement summary =
+                new PendingAnnouncement("__summary__", "已跳过 " + stale + " 条未播报的通知",
+                        now, now, 0L);
+        summary.summary = true;
+        summary.summaryCount = stale;
+        pendingAnnouncements.addFirst(summary);
+        recordEvent("合并 " + stale + " 条过期通知为一条摘要");
     }
 
+    /** 过期的报一次就够，别让用户在「最近处理记录」里看到一串重复行。 */
+    private void reportDropped(int dropped) {
+        if (dropped > 0) {
+            recordEvent("跳过 " + dropped + " 条过期通知");
+        }
+    }
+
+    /**
+     * 投一条。队列语义归 drainAnnouncementQueue，这里只负责「这一次开口」。
+     * 用 QUEUE_FLUSH 而非 QUEUE_ADD：串行投递下引擎队列里本来就只有这一条，
+     * FLUSH 顺手清掉上一次会话被 stop() 打断后可能残留的尾巴。
+     */
     private boolean speak(PendingAnnouncement item) {
-        String announcement = item.text;
         if (textToSpeech == null) {
             Log.e(TAG, "speak: TTS instance is null.");
+            // 引擎被回收但队列还在：回队等初始化重试，别把这条当已播报吞掉
+            requeueForRetry(item, 3000L);
             return false;
         }
-        boolean firstInBatch = activeUtterances.isEmpty();
-        if (firstInBatch && !requestAudioFocus()) {
-            Log.w(TAG, "speak: could not obtain audio focus.");
-            recordEvent("播报被跳过：音频焦点被其他应用占用，稍后重试");
-            // 没念出来的内容不能算「已播报」：isNewNotification 已经把这条
-            // 标成最新内容，不回队的话这条通知就永久丢了。
-            if (SystemClock.elapsedRealtime() - item.queuedAt <= MAX_QUEUE_AGE_MS) {
-                item.retried = true;
-                pendingAnnouncements.addFirst(item);
-                mainHandler.postDelayed(this::drainAnnouncementQueue, 3000L);
+        boolean newSession = speechPhase != SpeechPhase.SPEAKING;
+        if (newSession) {
+            if (!requestAudioFocus()) {
+                Log.w(TAG, "speak: could not obtain audio focus.");
+                recordEvent("播报被跳过：音频焦点被其他应用占用，稍后重试");
+                requeueForRetry(item, 3000L);
+                return false;
             }
-            return false;
-        }
-        if (firstInBatch) {
+            sessionSeq++;
+            speechPhase = SpeechPhase.SPEAKING;
+            // 新会话才提音量、才放提示音；会话中间动音量会让两条之间「掉一下声音」
             boostVolumeForSpeech();
-            if (!item.retried) {
+            if (item.retryCount == 0 && item.replayCount == 0 && !item.summary) {
                 playBeepIfNeeded();
             }
         }
-
-        String utteranceId = UUID.randomUUID().toString();
-        // 先登记再 speak：极短的语音可能在回调前就结束，顺序反过来会漏记
-        activeUtterances.add(utteranceId);
+        // 会话延续：取消上一次排队的还原
+        cancelPendingVolumeRestore();
+        currentItem = item;
+        armVolumeSafetyRestore();
+        // token 带会话号 + 条目号 + 重试次数：被冻结期间排队、解冻后集中爆发
+        // 的旧回调，以及 stop() 之后补发的回调，都会因为对不上而被丢弃。
+        // 重试次数与重播次数必须分开编码：两者混在一起时，一次重试会和上一次
+        // 失败留下的幽灵回调撞出同样的 id，那条回调就会被当成「当前这条」。
+        String token = "e" + engineEpoch + "-s" + sessionSeq + "-" + (++itemSeq)
+                + "-r" + item.retryCount + "-p" + item.replayCount;
+        activeToken = token;
         int result = textToSpeech.speak(
-                announcement, TextToSpeech.QUEUE_ADD, new Bundle(), utteranceId);
-        Log.i(TAG, "speak result=" + result + " text=" + announcement);
+                item.text, TextToSpeech.QUEUE_FLUSH, new Bundle(), token);
+        Log.i(TAG, "speak result=" + result + " text=" + item.text);
         recordEvent(result == TextToSpeech.SUCCESS ? "开始朗读" : "朗读失败 (code=" + result + ")");
         if (result == TextToSpeech.ERROR) {
             Log.e(TAG, "speak: TTS rejected the utterance.");
-            activeUtterances.remove(utteranceId);
-            if (activeUtterances.isEmpty()) {
-                abandonAudioFocus();
-                restoreVolumeAfterSpeech();
+            activeToken = null;
+            currentItem = null;
+            if (newSession) {
+                // 会话还没真正开始：焦点和音量都退回，下一次重试重新走一遍
+                endSpeechSessionNow();
             }
-            // 引擎瞬时繁忙也会返回 ERROR：不回队重试就等于永久丢了这条
-            if (SystemClock.elapsedRealtime() - item.queuedAt <= MAX_QUEUE_AGE_MS) {
-                item.retried = true;
-                pendingAnnouncements.addFirst(item);
-                mainHandler.postDelayed(this::drainAnnouncementQueue, 4000L);
+            // 先回队再重建：顺序反过来的话，重建完这条已经因为失败次数到顶被丢掉，
+            // 那就白重建了——最后一次尝试必须落在新引擎上。
+            requeueForRetry(item, 4000L);
+            speakFailStreak++;
+            if (speakFailStreak >= MAX_SPEAK_FAIL_STREAK) {
+                rebuildTextToSpeech("连续 " + speakFailStreak + " 次被引擎拒绝");
             }
             return false;
         }
-        mainHandler.postDelayed(utteranceTimeoutGuard, UTTERANCE_TIMEOUT_MS);
+        speakFailStreak = 0;
+        armStartGuard();
         return true;
     }
 
-    private void onUtteranceTimeoutGuard() {
-        if (!activeUtterances.isEmpty()) {
-            Log.w(TAG, "Utterance timeout guard fired; clearing " + activeUtterances.size());
-            onUtteranceFinished(null);
+    /**
+     * 没念出来的内容不能算「已播报」：isNewNotification 已经把这条标成最新内容，
+     * 不回队的话这条通知就永久丢了。但重试必须有上限，否则一条永远念不出的内容
+     * 会让引擎空转下去。
+     */
+    private void requeueForRetry(PendingAnnouncement item, long delayMs) {
+        if (SystemClock.elapsedRealtime() - item.queuedAt > MAX_QUEUE_AGE_MS) {
+            Log.i(TAG, "retry dropped: announcement already stale");
+            return;
         }
+        if (item.retryCount >= MAX_SPEAK_RETRIES) {
+            Log.w(TAG, "retry dropped: " + item.retryCount + " failures");
+            recordEvent("朗读多次失败，丢弃这条通知");
+            return;
+        }
+        item.retryCount++;
+        pendingAnnouncements.addFirst(item);
+        mainHandler.postDelayed(this::drainAnnouncementQueue, delayMs);
+    }
+
+    /** 启动守卫超时：speak() 说成功，引擎却一直没开口。 */
+    private void onStartGuardTimeout() {
+        if (speechPhase != SpeechPhase.SPEAKING || activeToken == null) {
+            return;
+        }
+        // 假超时：进程刚被解冻时，到期的 guard 会比刚排进来的 onStart 先出队。
+        // 实际触发时间比计划晚了 2 秒以上，说明线程被冻过，宽限一次。
+        if (!startGuardGraced
+                && SystemClock.elapsedRealtime() - startGuardDueMs > 2_000L) {
+            startGuardGraced = true;
+            Log.i(TAG, "start guard fired late (post-thaw), granting grace.");
+            armStartGuard();
+            return;
+        }
+        Log.w(TAG, "start guard fired: engine never spoke " + activeToken);
+        recordEvent("朗读超时：引擎没有开口");
+        activeToken = null;
+        currentItem = null;
+        speakFailStreak++;
+        if (speakFailStreak >= MAX_SPEAK_FAIL_STREAK) {
+            rebuildTextToSpeech("引擎一直没有开口");
+        }
+        drainAnnouncementQueue();
+    }
+
+    /** 完成守卫超时：开口了但迟迟不回调 onDone/onError。 */
+    private void onFinishGuardTimeout() {
+        if (speechPhase != SpeechPhase.SPEAKING || activeToken == null) {
+            return;
+        }
+        if (!finishGuardGraced
+                && SystemClock.elapsedRealtime() - finishGuardDueMs > 2_000L) {
+            finishGuardGraced = true;
+            Log.i(TAG, "finish guard fired late (post-thaw), granting grace.");
+            armFinishGuard();
+            return;
+        }
+        Log.w(TAG, "finish guard fired " + activeToken);
+        if (textToSpeech != null) {
+            textToSpeech.stop();
+        }
+        // stop() 之后引擎补发的 onStop 会因为 token 已置空被丢弃
+        activeToken = null;
+        currentItem = null;
+        drainAnnouncementQueue();
     }
 
     private boolean requestAudioFocus() {
@@ -1263,7 +1796,7 @@ public class NotificationReaderService extends NotificationListenerService {
                 .setAudioAttributes(speechAudioAttributes())
                 .setOnAudioFocusChangeListener(focusChange -> {
                     // 空实现会让 TTS 压在对方语音上继续念（来电、导航、音乐）
-                    mainHandler.post(() -> onAudioFocusLost(focusChange));
+                    mainHandler.post(() -> onAudioFocusChanged(focusChange));
                 })
                 .build();
         boolean granted = audioManager.requestAudioFocus(audioFocusRequest)
@@ -1272,55 +1805,176 @@ public class NotificationReaderService extends NotificationListenerService {
         return granted;
     }
 
-    private void onUtteranceFinished(String utteranceId) {
-        if (utteranceId == null) {
-            // 超时守卫：不再信任回调，直接清空
-            if (activeUtterances.isEmpty()) {
-                return;
-            }
-            activeUtterances.clear();
-        } else if (!activeUtterances.remove(utteranceId)) {
-            // 同一条语音的重复回调（有些引擎同时发 onDone 和 onStop），忽略
-            Log.i(TAG, "duplicate TTS finish callback " + utteranceId + ", ignored.");
+    /**
+     * 引擎回调统一的出口。token 对不上的回调一律丢弃：
+     * 冻结期间 oneway 回调会排队、解冻后集中爆发，而同一时刻只可能有一条在念。
+     */
+    private void onUtteranceFinished(String token, boolean failed) {
+        if (token == null || !token.equals(activeToken)) {
+            Log.i(TAG, "stale TTS callback " + token + ", ignored.");
             return;
         }
-        if (activeUtterances.isEmpty()) {
-            // 不撤的话，上一批残留的守卫会在下一批刚 speak、还没 onStart 的
-            // 空隙里误触发，把新批次连焦点带音量一起清掉
-            mainHandler.removeCallbacks(utteranceTimeoutGuard);
-            abandonAudioFocus();
+        activeToken = null;
+        currentItem = null;
+        if (failed) {
+            speakFailStreak++;
+            if (speakFailStreak >= MAX_SPEAK_FAIL_STREAK) {
+                rebuildTextToSpeech("连续 " + speakFailStreak + " 次朗读失败");
+            }
+        } else {
+            speakFailStreak = 0;
+        }
+        // 会话延续：队列里还有内容就接着投下一条，中间不释放焦点、不动音量，
+        // 否则两条之间会「掉一下音量 + 一声提示音」，整段听感是断的。
+        // 队列空了 drain 自己会调 endSpeechSession 收尾。
+        drainAnnouncementQueue();
+    }
+
+    /** 会话正常收尾：延迟 400ms 还原音量，避开 A2DP 管线的尾音。 */
+    private void endSpeechSession() {
+        finishSession(true);
+    }
+
+    /** 需要立刻还原音量的出口：关闭播报、拔耳机、焦点被长期占用。 */
+    private void endSpeechSessionNow() {
+        finishSession(false);
+    }
+
+    /** 所有出口的唯一收尾点。 */
+    private void finishSession(boolean delayRestore) {
+        cancelGuards();
+        activeToken = null;
+        currentItem = null;
+        speechPhase = SpeechPhase.IDLE;
+        abandonAudioFocus();
+        if (delayRestore) {
+            scheduleVolumeRestore();
+        } else {
+            cancelPendingVolumeRestore();
             restoreVolumeAfterSpeech();
+        }
+        // 不变量：IDLE 必须意味着「没有在念、没有焦点、没有守卫」。
+        // 这里只做诊断——真漏了置位时，靠这行日志能一眼看出是哪个出口漏的。
+        if (activeToken != null || currentItem != null || audioFocusRequest != null) {
+            Log.w(TAG, "session invariant broken at IDLE: token=" + activeToken
+                    + " item=" + (currentItem == null ? "null" : "set")
+                    + " focus=" + (audioFocusRequest != null));
+        }
+    }
+
+    /** 暂停：撤守卫、放焦点，但**不**还原音量——会话还要继续，还原会掉一下声音。 */
+    private void pauseSpeechSession() {
+        cancelGuards();
+        activeToken = null;
+        currentItem = null;
+        speechPhase = SpeechPhase.PAUSED;
+        abandonAudioFocus();
+    }
+
+    private void resumeFromPause() {
+        if (speechPhase != SpeechPhase.PAUSED) {
+            return;
+        }
+        // 先试探焦点再续播：通话或导航独占焦点时无条件 drain 等于强行插嘴。
+        // 试探成功后立刻放手，真正的会话由 speak() 里重新申请。
+        if (!requestAudioFocus()) {
+            Log.i(TAG, "resume deferred: audio focus still held by others.");
+            mainHandler.postDelayed(this::resumeFromPause, 15_000L);
+            return;
+        }
+        abandonAudioFocus();
+        speechPhase = SpeechPhase.IDLE;
+        drainAnnouncementQueue();
+    }
+
+    /** 引擎连续失败时重建：不重建的话整条会话会一直空转到队列全部过期。 */
+    private void rebuildTextToSpeech(String reason) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - rebuildWindowStartMs > REBUILD_WINDOW_MS) {
+            rebuildWindowStartMs = now;
+            rebuildCount = 0;
+        }
+        if (rebuildCount >= MAX_REBUILD_PER_WINDOW) {
+            // 引擎反复坏掉时无限重建只会持续占用 CPU，而且照样念不出来
+            Log.w(TAG, "rebuild suppressed (" + rebuildCount + " in window): " + reason);
+            recordEvent("TTS 引擎反复失败，已暂停自动重建");
+            return;
+        }
+        rebuildCount++;
+        // 代数先加：旧引擎在 shutdown 之后仍可能补发 onDone/onStop，
+        // 只靠会话号+条目号会让它们和新 token 撞成同一串。
+        engineEpoch++;
+        long delay = Math.min(3_000L * rebuildCount, 30_000L);
+        Log.w(TAG, "rebuilding TTS engine: " + reason);
+        recordEvent("重建 TTS 引擎：" + reason);
+        speakFailStreak = 0;
+        ttsReady = false;
+        TextToSpeech broken = textToSpeech;
+        textToSpeech = null;
+        if (broken != null) {
+            try {
+                broken.stop();
+                broken.shutdown();
+            } catch (RuntimeException ignored) {
+                // 引擎已经坏了，关闭失败没有补救手段
+            }
+        }
+        if (!destroyed) {
+            // 退避：重建是异步的（等 onInit），期间 ttsReady=false，条目留在队里
+            mainHandler.postDelayed(this::initializeTextToSpeech, delay);
         }
     }
 
     /**
-     * 焦点被抢时必须停嘴，但要不要丢积压得分情况：
-     * LOSS（对方长期持有，例如音乐开始播放）短期回不来，停播并丢弃积压；
-     * TRANSIENT / CAN_DUCK（导航一句、来电铃声）只是短抢占，队列必须留着稍后重试，
-     * 否则一句导航语音就能把整批消息永久吞掉——那些条目早已被标记「已播报」。
+     * 焦点变化分三种处理，关键区别是「已标记已播报的内容会不会丢」：
+     * GAIN —— 对方让回来了，从暂停态恢复续播；
+     * LOSS_TRANSIENT_CAN_DUCK —— 对方允许只降不停。**不自己拧音量**：
+     *   boost/restore 动的是 STREAM_MUSIC，导航提示音和用户的音乐都在同一条流上，
+     *   压一半等于把它们一起压掉，而通知是叠在导航上面的语音，压自己并不会
+     *   让自己「更清楚」。这里只保持继续播，让系统按 CONTENT_TYPE_SPEECH 去处理；
+     * LOSS_TRANSIENT / LOSS —— 必须停嘴。TRANSIENT 保留积压并把被掐断的
+     *   这条回队重播一次（它已经算「已播报」），LOSS 短期回不来，直接丢弃积压。
      */
-    private void onAudioFocusLost(int focusChange) {
-        if (activeUtterances.isEmpty() && pendingAnnouncements.isEmpty()) {
+    private void onAudioFocusChanged(int focusChange) {
+        if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+            if (speechPhase == SpeechPhase.PAUSED) {
+                Log.i(TAG, "audio focus gained, resuming.");
+                resumeFromPause();
+            }
+            return;
+        }
+        if (speechPhase == SpeechPhase.IDLE && pendingAnnouncements.isEmpty()) {
+            return;
+        }
+        if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+            Log.i(TAG, "audio focus can_duck: keep speaking at full volume.");
             return;
         }
         boolean permanent = focusChange == AudioManager.AUDIOFOCUS_LOSS;
         Log.i(TAG, "audio focus lost, focusChange=" + focusChange
                 + " permanent=" + permanent);
         if (permanent) {
+            endSpeechSessionNow();
             pendingAnnouncements.clear();
             recordEvent("焦点被长期占用，已停止播报并丢弃积压");
-        } else {
-            recordEvent("焦点被短暂抢占，已暂停，稍后继续");
+            return;
         }
-        activeUtterances.clear();
+        // 短暂抢占（来电、导航播报）：stop() 会掐断当前这条，而它已经算「已播报」，
+        // 不回队就是静默丢失。每条只重播一次，避免「念不完→被打断→再念」的死循环。
+        PendingAnnouncement interrupted = currentItem;
         if (textToSpeech != null) {
             textToSpeech.stop();
         }
-        abandonAudioFocus();
-        restoreVolumeAfterSpeech();
-        if (!permanent) {
-            mainHandler.postDelayed(this::drainAnnouncementQueue, 5000L);
+        pauseSpeechSession();
+        if (interrupted != null && !interrupted.summary && interrupted.replayCount < 1) {
+            interrupted.replayCount++;
+            interrupted.retryCount = 0;
+            pendingAnnouncements.addFirst(interrupted);
         }
+        // 暂停由外界造成，队列年龄顺延（有上限），别因此把整批消息丢掉
+        deferQueueAge();
+        recordEvent("焦点被短暂抢占，已暂停，稍后继续");
+        mainHandler.postDelayed(this::resumeFromPause, 5000L);
     }
 
     private void abandonAudioFocus() {
@@ -1344,14 +1998,27 @@ public class NotificationReaderService extends NotificationListenerService {
     private static final class PendingAnnouncement {
         final String key;
         final String text;
-        final long queuedAt;
-        /** 重试过的条目不再放提示音，免得引擎繁忙时每 4 秒「嘀」一次。 */
-        boolean retried;
+        /** 原始进队时刻：队列年龄顺延的基线，本身永不改动。 */
+        final long enqueuedAt;
+        /** 过期判定用的时刻，焦点被短暂抢占时顺延（相对 enqueuedAt 最多 60 秒）。 */
+        long queuedAt;
+        /** speak() 失败重试次数：重试过的条目不再放提示音。 */
+        int retryCount;
+        /** 被焦点抢占重播的次数：每条最多一次，防「念不完→被打断→再念」的死循环。 */
+        int replayCount;
+        /** 是否为「n 条未播报」的合并摘要：摘要不参与再合并。 */
+        boolean summary;
+        int summaryCount;
+        /** 通知系统的发布时间（墙钟毫秒）：冻结期间积压的回调靠它识别真实新旧。 */
+        final long postTime;
 
-        PendingAnnouncement(String key, String text, long queuedAt) {
+        PendingAnnouncement(String key, String text, long enqueuedAt, long queuedAt,
+                long postTime) {
             this.key = key;
             this.text = text;
+            this.enqueuedAt = enqueuedAt;
             this.queuedAt = queuedAt;
+            this.postTime = postTime;
         }
     }
 

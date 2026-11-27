@@ -16,6 +16,34 @@ PREFS=$DATA/shared_prefs/airannounce_settings.xml
 PIDFILE=$MODDIR/keepalive.pid
 LOG=$MODDIR/keepalive.log
 LOG_MAX=262144
+# 应用 → 模块的监听修复请求（应用无权 su，只能反向投递给守护执行）
+HEAL_REQUEST=$DATA/files/heal_request
+# 模块 → 应用的存活心跳（应用读不到 /data/adb，只能看这个文件的新鲜度）
+MODULE_SEEN=$DATA/files/module_seen
+# 守护自己的「切换中」标记。为什么不放 $DATA/files：
+#   1) 应用目录在 FBE 解锁前不可见，而开机早期的崩溃正是这个标记要防的场景；
+#   2) 守护往应用目录写文件要处理属主和 SELinux 标签，模块目录没有这些问题。
+HEAL_INFLIGHT=$MODDIR/heal_inflight
+# 播报音量兜底：应用 boost 前落盘 original target max leaseUntil kind，
+# 进程被冻住/杀掉时由这里按租约还原（app 内定时器冻住就停摆了）。
+VOLUME_MARKER=$DATA/files/volume_original
+# 监听组件名：fix_listener 与补授权块共用
+LC="$PKG/com.sakura.airannounce.NotificationReaderService"
+# 最近一次请求的处理结果，作为回执写进 module_seen
+LAST_RESULT=""
+# 上次因为「音量标记过期」拉起应用的时刻：30 秒内不重复拉起
+VOL_WAKE_AT=0
+# 上次执行 disallow/allow 切换的时刻：30 秒内不重切
+LAST_FIX_AT=0
+# 默认 TTS 引擎。它被冻住时 speak() 会返回成功却永远等不到 onStart，
+# 应用侧只能记成失败并推高重建计数 —— 所以这里顺手把它也解冻。
+TTS_PKG=$(settings get secure tts_default_synth 2>/dev/null)
+case "$TTS_PKG" in
+'' | null | */*) TTS_PKG="" ;;
+esac
+VER=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null)
+LAST_HEAL_REQ=""
+SEEN_AT=0
 
 if ! : >>"$LOG" 2>/dev/null; then
     # 模块目录不可写时退到 /data/local/tmp，adb shell 也能直接看
@@ -111,6 +139,9 @@ app_pid() {
 flag_age() {
     NOW=${1:-$(date +%s)}
     TS=$(cat "$FLAG" 2>/dev/null)
+    # 2.9.4+ 写的是「<毫秒戳> <0|1>」，只取第一段做时间戳；
+    # 旧版 app 写的是纯毫秒戳，${TS%% *} 对它是恒等操作，向后兼容。
+    TS=${TS%% *}
     case "$TS" in
         ''|*[!0-9]*)
             MT=$(stat -c %Y "$FLAG" 2>/dev/null)
@@ -175,30 +206,79 @@ listener_granted() {
         | tr ':' '\n' | grep -q "com.sakura.airannounce"
 }
 
-listener_bound() {
+# 绑定位不再单独开文件，改为读 active 内容里的第二段（2.9.4+ 写入 <毫秒戳> <0|1>）。
+# 原因（本机实测复现过）：只在事件里增删的独立标记文件，进程被 SIGKILL 时不会被删，
+# 模块会拿残留标记一直认为"已绑定"，从而永久跳过 dumpsys 复查与自愈。
+# active 由保活服务每 60 秒重写，进程一死时间戳立刻变旧，陈旧度天然覆盖残留问题。
+# 本机实测全量 dumpsys notification 单次 347～364 ms、输出 1.5 MB，
+# 每分钟一次折合约 0.85% 单核，比应用自己的轮询还贵，所以快路径必须便宜。
+# 限频计数：4 次跳过 ≈ 5 分钟一次（高频循环 5 秒一跳）
+LISTENER_DUMP_SKIP=0
+
+# 立刻跑一次真实检查，不受限频影响。fix_listener 重绑后的复查必须用它：
+# 限频逻辑在没有证据时会「按已绑定处理」，如果复查走限频路径，
+# 会把重绑失败直接判成成功，还会把失败计数清零，掩盖真实故障。
+listener_bound_now() {
     dumpsys notification 2>/dev/null \
         | sed -n '/Live notification listeners/,/Snoozed/p' \
         | grep -q "com.sakura.airannounce"
 }
 
+# 从 active 内容读绑定位：1=已绑定，0=未绑定，空=旧版 app 未提供该字段。
+listener_flag() {
+    set -- $(cat "$FLAG" 2>/dev/null)
+    echo "${2:-}"
+}
+
+listener_bound() {
+    # 快路径：标记新鲜（保活服务 60 秒重写一次，这里留 3 分钟余量）且明确写着已绑定。
+    # 只用"明确的 1"当证据；0、缺字段、标记陈旧三种情况一律回落真实复查。
+    if [ "$(listener_flag)" = "1" ] && [ "$(flag_age)" -lt 180 ]; then
+        return 0
+    fi
+    # 限频只作用于这条周期检查路径；fix_listener 的即时复查走 listener_bound_now，
+    # 不受这里影响——否则会把重绑失败误判成成功。
+    if [ "$LISTENER_DUMP_SKIP" -gt 0 ]; then
+        LISTENER_DUMP_SKIP=$((LISTENER_DUMP_SKIP - 1))
+        return 0
+    fi
+    LISTENER_DUMP_SKIP=4
+    listener_bound_now
+}
+
 fix_listener() {
-    LC="$PKG/com.sakura.airannounce.NotificationReaderService"
+    # 节流：切换本身要 7 秒左右，期间绑定状态本来就不稳。上一次失败后
+    # 立刻再来一次，会在两轮之间反复 disallow，越切越乱（本机实测连切 3 次）。
+    if [ $((NOW_S - LAST_FIX_AT)) -lt 30 ]; then
+        log "距上次切换不足 30 秒（$((NOW_S - LAST_FIX_AT)) 秒），本轮跳过"
+        return 1
+    fi
+    LAST_FIX_AT=$NOW_S
     log "监听未绑定（权限仍在），执行 disallow/allow 切换"
+    # 先把「切换中」标记落盘再动手：disallow 之后到 allow 生效之间有一段授权为空
+    # 的窗口，本进程若在窗口里被杀/重启，权限就永远停在空的状态 —— 之后每次自愈的
+    # 前置条件都是「权限本来就在」，永远不成立，监听就此永久关闭，只能人工重新授权。
+    date +%s > "$HEAL_INFLIGHT" 2>/dev/null
     cmd notification disallow_listener "$LC" 0 >/dev/null 2>&1
     sleep 1
     cmd notification allow_listener "$LC" 0 >/dev/null 2>&1
     sleep 3
-    if ! listener_bound; then
+    if ! listener_bound_now; then
         # 2026-11-12 现场：切换本身没问题，但进程刚被解冻/刚重启时，绑定要几秒才生效，
         # 只在 2 秒后就判定失败会误判。这里先叫醒进程，再给一次机会。
         wake_app
         sleep 3
     fi
-    if listener_bound; then
+    # 成功判定要回读设置而不是信退出码：cmd 在多数失败情形下也返回 0，
+    # 只有 enabled_notification_listeners 里真的还有本组件才算授权回来了。
+    if listener_bound_now && listener_granted; then
         log "监听已重新绑定"
+        rm -f "$HEAL_INFLIGHT"
         LISTENER_FAIL=0
         LISTENER_SKIP=0
+        LAST_RESULT="fixed"
     else
+        # 标记故意保留：节拍会看见它并补一次，直到授权回来或超过 10 分钟
         LISTENER_FAIL=$((LISTENER_FAIL + 1))
         log "监听重绑失败（$LISTENER_FAIL/3）"
         if [ "$LISTENER_FAIL" -ge 3 ]; then
@@ -303,6 +383,117 @@ foreground_ok() {
 }
 
 while true; do
+    # 时间戳每个节拍取一次就够，后面几块都要用；原来只在心跳里取，
+    # 补救块要用时还得再 fork 一次 date。
+    NOW_S=$(date +%s)
+
+    # ---- 应用请求的监听修复 ----
+    # 为什么是文件而不是命令：本机实测 app uid 执行 /system/bin/su 得到 ENOENT
+    # （KernelSU 只对已授权 UID 做 su 的 exec 重定向，未授权 UID 看不到该文件），
+    # 「应用自己提权」在 KernelSU 上不成立。应用写自己的 files 目录不需要任何权限，
+    # 守护读到就代它执行 —— 这是有 root 时唯一稳的一条通道。
+    if [ -f "$HEAL_REQUEST" ]; then
+        CUR_REQ=$(cat "$HEAL_REQUEST" 2>/dev/null)
+        # 只认内容变化：应用会保留该文件，靠时间戳区分新请求，避免写删竞争
+        if [ -n "$CUR_REQ" ] && [ "$CUR_REQ" != "$LAST_HEAL_REQ" ]; then
+            LAST_HEAL_REQ=$CUR_REQ
+            log "收到应用监听修复请求（$CUR_REQ）"
+            if listener_granted && ! listener_bound_now; then
+                fix_listener
+            else
+                log "复查后监听仍正常，忽略该请求"
+                LAST_RESULT="ignored"
+            fi
+        fi
+    fi
+
+    # ---- 上次切换绑定被打断的补救 ----
+    # 这是整条自愈链上最危险的一处：切换窗口里守护被杀/重启，授权就停在空的状态，
+    # 而所有自愈路径的前置条件都是「权限本来就在」，于是永久不成立。
+    if [ -f "$HEAL_INFLIGHT" ]; then
+        IF_TS=$(cat "$HEAL_INFLIGHT" 2>/dev/null)
+        case "$IF_TS" in
+        '' | *[!0-9]*) IF_TS=$NOW_S ;;
+        esac
+        IF_AGE=$((NOW_S - IF_TS))
+        if [ "$IF_AGE" -ge 600 ]; then
+            # 十分钟还没补回来，多半是用户自己撤了授权：不再替他改
+            rm -f "$HEAL_INFLIGHT"
+            log "切换标记超过 10 分钟，放弃自动补授权"
+        elif [ "$IF_AGE" -ge 5 ]; then
+            if listener_granted; then
+                if listener_bound_now; then
+                    rm -f "$HEAL_INFLIGHT"
+                    log "上次的监听切换已完成，清理标记"
+                elif [ "$IF_AGE" -ge 20 ] && [ $((NOW_S - LAST_FIX_AT)) -ge 30 ]; then
+                    # 只在真正要动手时打日志：否则连续失败期间每个节拍都会
+                    # 刷一行「重新切一次」再被节流跳过，日志会被这点噪音淹掉
+                    log "上次的监听切换被打断（$IF_AGE 秒），重新切一次"
+                    fix_listener
+                fi
+            else
+                # 授权已经空了：这就是要救的状态，立刻补，不等 20 秒
+                log "上次切换把授权撤掉了（$IF_AGE 秒），立即补 allow_listener"
+                cmd notification allow_listener "$LC" 0 >/dev/null 2>&1
+                rm -f "$HEAL_INFLIGHT"
+                sleep 2
+                if listener_bound_now; then
+                    log "监听已补回"
+                    LAST_RESULT="recovered"
+                else
+                    log "补回失败，下一拍重试"
+                fi
+            fi
+        fi
+    fi
+
+    # ---- 播报音量兜底 ----
+    # 应用 boost 前会落盘 original target max leaseUntil kind。进程被冻进 freezer 时
+    # 它自己的定时器跟着停摆，音量就停在抬高值上一直冲耳朵，只能靠这里收尾。
+    if [ -f "$VOLUME_MARKER" ]; then
+        read -r V_ORIG V_TARGET V_MAX V_LEASE V_KIND < "$VOLUME_MARKER" 2>/dev/null
+        case "$V_LEASE" in
+        '' | *[!0-9]*) V_LEASE=0 ;;
+        esac
+        CUR_MS=$((NOW_S * 1000))
+        if [ -n "$V_ORIG" ] && [ "$CUR_MS" -ge $((V_LEASE + 5000)) ]; then
+            if [ "$V_KIND" = "bt" ] && ! bt_audio_active; then
+                # 原值是耳机那一档。耳机不在时写进去会改扬声器那一档，
+                # 而耳机那一档还留在 boost 值上 —— 等设备回来再处理。
+                :
+            elif [ -z "$(app_pid)" ]; then
+                # 这里刻意**不**用 cmd media_session volume 直接改音量。
+                # 本机实测该命令会 clamp（set 26 得到 16、set 60 得到 50、
+                # set 140 得到 100），拿它「还原」等于随机改用户音量，
+                # 戴耳机时就是往耳朵里怼。正确做法只有一条：拉起应用，
+                # 让应用用 AudioManager 精确还原（应用侧恢复是精确的）。
+                if [ $((NOW_S - VOL_WAKE_AT)) -ge 30 ]; then
+                    VOL_WAKE_AT=$NOW_S
+                    log "音量标记已过期，拉起应用让它自己还原（不碰音量）"
+                    wake_app
+                fi
+            fi
+        fi
+    fi
+
+    # ---- 存活心跳 ----
+    # 每分钟刷一次 mtime，应用据此判断「有守护可用」，从而决定走模块还是 Shizuku。
+    # 内容扩成「时间戳 版本 最后请求 结果」，同时当心跳和请求回执：
+    # 只靠 onListenerConnected 当回执有洞 —— 「复查后忽略」不会产生那个回调，
+    # 应用只看到沉默，分不清「模块没在」和「监听本来就好」。
+    if [ $((NOW_S - SEEN_AT)) -ge 60 ] || [ ! -f "$MODULE_SEEN" ]; then
+        SEEN_AT=$NOW_S
+        if echo "$NOW_S $VER $LAST_HEAL_REQ $LAST_RESULT" > "$MODULE_SEEN" 2>/dev/null; then
+            # 必须交还给应用 uid：root 属主的 600 文件 untrusted_app 读不到，心跳就白写了
+            # 属主连组一起交还：只改 user 时组仍是 root，虽然 600 下不影响读取，
+            # 但后续若改成 640/660 就会立刻变成「应用读不到」的隐性故障
+            chown "$(stat -c %u:%g "$DATA" 2>/dev/null)" "$MODULE_SEEN" 2>/dev/null
+            chmod 600 "$MODULE_SEEN" 2>/dev/null
+            # 属主改回应用之后标签也得跟着改，否则 untrusted_app 仍然 EACCES，
+            # 结果就是应用永远判「模块不在」，无条件降级到 Shizuku。
+            restorecon "$MODULE_SEEN" >/dev/null 2>&1
+        fi
+    fi
     PID=$(app_pid)
 
     if [ -n "$PID" ]; then
@@ -341,6 +532,21 @@ while true; do
             fi
             thaw
             TICK_HIGH=$((TICK_HIGH + 1))
+            # 每 5 拍（约 25 秒）顺手解冻一次 TTS 引擎：只解冻不拉起，
+            # 引擎由系统按需 bind。放高频块里是因为它只在「有耳机要播报」时才有意义。
+            if [ -n "$TTS_PKG" ] && [ $((TICK_HIGH % 5)) -eq 0 ]; then
+                TTS_PID=$(pidof "$TTS_PKG" 2>/dev/null | awk '{print $1}')
+                if [ -n "$TTS_PID" ]; then
+                    TTS_FREEZE_F=$(freeze_file_of "$TTS_PID")
+                    if [ -n "$TTS_FREEZE_F" ] && [ -r "$TTS_FREEZE_F" ]; then
+                        read -r TTS_FROZEN <"$TTS_FREEZE_F" 2>/dev/null
+                        if [ "$TTS_FROZEN" = "1" ] \
+                            && echo 0 >"$TTS_FREEZE_F" 2>/dev/null; then
+                            log "顺带解冻 TTS 引擎 $TTS_PKG pid=$TTS_PID"
+                        fi
+                    fi
+                fi
+            fi
             # 一分钟做一次状态复查：开关、前台服务是否还在
             if [ $((TICK_HIGH % 12)) -eq 0 ]; then
                 if ! announce_enabled; then

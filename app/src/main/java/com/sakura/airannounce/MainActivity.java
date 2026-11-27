@@ -51,6 +51,8 @@ public class MainActivity extends Activity {
     static final String KEY_DND_START = "dnd_start_hour";
     static final String KEY_DND_END = "dnd_end_hour";
     static final String KEY_POLL_INTERVAL = "poll_interval_ms";
+    /** 智能省电轮询：按「连续零补获」次数自适应退避；关掉则严格照上面的固定档位。 */
+    static final String KEY_ADAPTIVE_POLL = "adaptive_poll";
 
     static final int DEFAULT_VOLUME_PERCENT = 80;
     static final int DEFAULT_SPEECH_RATE = 100;
@@ -84,6 +86,7 @@ public class MainActivity extends Activity {
     private TextView shizukuStateLabel;
     private Button shizukuGrantButton;
     private Button shizukuApplyButton;
+    private TextView shizukuDescView;
     private final Switch.OnCheckedChangeListener enabledSwitchListener = (button, checked) -> {
         preferences.edit().putBoolean(KEY_ENABLED, checked).apply();
         syncKeepAlive(this);
@@ -998,12 +1001,18 @@ public class MainActivity extends Activity {
 
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
+                NotificationReaderService.refreshPollCadence();
             }
         });
         body.addView(pollBar, matchWrap());
+        addSwitch(body, R.string.adaptive_poll, KEY_ADAPTIVE_POLL, true);
 
         TextView pollHint = new TextView(this);
-        pollHint.setText("未连接耳机时完全停掉轮询（只保留 2 分钟空闲心跳）；检测到系统回调恢复正常后自动降频。");
+        pollHint.setText("未连接耳机时完全停掉轮询（只保留 2 分钟空闲心跳）。\n"
+                + "自适应开启时，上面这一档是「最快档」：连续轮询都补不到东西（说明只是没事发生）"
+                + "会逐级放慢到 15 秒、30 秒，灭屏且长时间无事才到 60 秒；"
+                + "一旦某次轮询补到了本该由系统回调送来的通知（说明回调在漏投），立刻回到最快档。"
+                + "监听器掉线时不受退避限制，直接用最快档。关掉自适应则始终按最快档跑。");
         pollHint.setTextSize(12);
         pollHint.setTextColor(TEXT_TERTIARY);
         pollHint.setPadding(0, dp(4), 0, dp(8));
@@ -1064,12 +1073,11 @@ public class MainActivity extends Activity {
             }
         }), copyParams);
 
-        // ---- Shizuku 通道（无 Root 时的降级方案）----
-        body.addView(createSectionTitle("Shizuku 通道（可选，无 Root 时用）"));
+        // ---- 提权通道：有 Root 走 Root，无 Root 才轮到 Shizuku ----
+        body.addView(createSectionTitle("提权通道（Root 优先，Shizuku 兜底）"));
         TextView shizukuDesc = new TextView(this);
-        shizukuDesc.setText("借 Shizuku 的 shell 权限补做三件事：重绑监听、standby 拉 active、"
-                + "加入电池白名单；监听掉线时每分钟自动用 Shizuku 切换一次绑定（比应用自身的\n"
-                + "重绑请求可靠）。无法解冻被冻结的进程，仅作无 Root 设备的兜底。");
+        shizukuDescView = shizukuDesc;
+        shizukuDesc.setText("正在检测提权通道…");
         shizukuDesc.setTextSize(12.5f);
         shizukuDesc.setTextColor(TEXT_SECONDARY);
         shizukuDesc.setLineSpacing(dp(3), 1.0f);
@@ -1176,6 +1184,10 @@ public class MainActivity extends Activity {
         shizukuGrantButton = grant;
         shizukuApplyButton = apply;
         new Thread(() -> {
+            // su 探测和 Binder 调用都不能在主线程做：首次探测还可能弹出 Root 授权框
+            final boolean rootOk = RootChannel.isAvailable(this);
+            // 守护模块才是本机真正可用的通道：KernelSU 下 app 进程执行不了 su
+            final boolean moduleAlive = ModuleChannel.isAlive(this);
             final ShizukuChannel.State state = ShizukuChannel.state(this);
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed()) {
@@ -1191,7 +1203,25 @@ public class MainActivity extends Activity {
                 apply.setEnabled(ready);
                 // 自定义背景不会跟着 enabled 变色，手动降透明度避免看起来能点
                 apply.setAlpha(ready ? 1f : 0.4f);
-                String text = "状态：" + ShizukuChannel.describe(state);
+                if (shizukuDescView != null) {
+                    shizukuDescView.setText(moduleAlive
+                            ? "本机装了守护模块（root）：监听掉线时应用只投递一个修复请求，"
+                            + "由模块在自己的 5 秒节拍里执行切换绑定。"
+                            + "这条通道不需要 Shizuku，也不需要应用自己提权 ——"
+                            + "KernelSU 只对已授权 UID 重定向 su（未授权时是 ENOENT），"
+                            + "所以「应用内提权」在这里本来就走不通。"
+                            : rootOk
+                            ? "本机有 Root 但没装守护模块：监听掉线时会用 su 切换一次绑定。"
+                            + "更推荐装上模块，Su 通道在 KernelSU 上多半拿不到（ENOENT）。"
+                            : "本机没有 Root，也没装守护模块：监听掉线时借 Shizuku 的 shell 权限"
+                            + "切换绑定，并补做 standby 拉 active、加入电池白名单。"
+                            + "Shizuku 重启后需要重新激活，否则这条兜底会静默失效。"
+                            + "两条通道都不可用时才退回应用自身的重绑请求。");
+                }
+                String text = (moduleAlive ? "提权通道：守护模块（root）｜"
+                        : rootOk ? "提权通道：Root（uid 0）｜"
+                        : "提权通道：无 Root｜")
+                        + "状态：" + ShizukuChannel.describe(state);
                 if (state == ShizukuChannel.State.READY) {
                     long last = preferences.getLong(ShizukuChannel.KEY_LAST_APPLIED, 0L);
                     if (last > 0L) {
@@ -1860,6 +1890,8 @@ public class MainActivity extends Activity {
             preferences.edit().putBoolean(key, checked).apply();
             if (KEY_ENABLED.equals(key)) {
                 syncKeepAlive(this);
+            } else if (KEY_ADAPTIVE_POLL.equals(key)) {
+                NotificationReaderService.refreshPollCadence();
             }
         });
         parent.addView(toggle, matchWrap());

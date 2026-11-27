@@ -63,7 +63,16 @@ public class KeepAliveService extends Service {
             // 服务一旦停掉，这个 tick 随之消失，标记自然变旧，模块就会降频 —— 与 TAKEOVER 里
             // 「不要在通知心跳里刷 mtime」的约定一致（那条针对的是监听服务的心跳）。
             touchActiveFlag();
-            if (NotificationReaderService.getInstance() == null) {
+            // 先把「上次没做完的事」收尾，再判活：
+            // 1) 切换绑定被打断 → 权限可能停在空的，靠 heal_inflight 这个磁盘标记补回；
+            // 2) 音量提上去没还原 → 进程被冻住时 app 内定时器停摆，会一直冲耳朵。
+            // 两件事都只看磁盘状态，进程重启后同样有效。
+            ListenerHeal.recoverStuck(KeepAliveService.this);
+            SpeechVolumeGuard.recoverIfNeeded(
+                    KeepAliveService.this, NotificationReaderService.isSpeakingNow());
+            // 用绑定标志而不是 getInstance()==null：后者在「服务对象还在、绑定已断」
+            // 的窗口里会判成正常（本机实测该盲窗约 5 分钟）。
+            if (!NotificationReaderService.isListenerBound()) {
                 unboundTicks++;
                 if (unboundTicks == ALERT_AFTER_TICKS) {
                     NotificationReaderService.recordEvent("提醒：监听已断开超过 "
@@ -71,9 +80,10 @@ public class KeepAliveService extends Service {
                     ListenerAlert.post(KeepAliveService.this);
                 }
                 Log.w(TAG, "listener is not bound; self-healing.");
-                // 优先走 Shizuku 的 disallow/allow 切换：requestRebind 在部分 ROM 上是空操作，
-                // 而切换是实测唯一稳定有效的手段。没有可用 Shizuku 时才退回 requestRebind。
-                if (!ShizukuChannel.healListenerAsync(KeepAliveService.this)) {
+                // 先 Root（有 root 时唯一正确选择，不依赖任何外部 App），
+                // 没 root 才用 Shizuku；两条通道都不可用才退回 requestRebind ——
+                // 它在这类 ROM 上常是空操作。
+                if (!ListenerHeal.healAsync(KeepAliveService.this)) {
                     NotificationReaderService.recordEvent("自检：监听未绑定，尝试重绑");
                     NotificationReaderService.requestRebindIfNeeded(KeepAliveService.this);
                 }
@@ -135,7 +145,10 @@ public class KeepAliveService extends Service {
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
                 () -> NotificationReaderService.requestRebindIfNeeded(this), 1500L);
         healthHandler.removeCallbacks(listenerCheck);
-        healthHandler.postDelayed(listenerCheck, LISTENER_CHECK_INTERVAL_MS);
+        // 首次立即跑一次，而不是等满 60 秒。进程被拉起这个动作本身就说明「刚出过事」
+        // （被冻住、被杀、装包导致解绑），这时候最该做的恰恰是补收尾：切换绑定窗口的
+        // 授权、抬高却没还原的音量。等一分钟才检查，音量就在高位上多挂一分钟。
+        healthHandler.post(listenerCheck);
     }
 
     private java.io.File activeFlagFile() {
@@ -143,17 +156,24 @@ public class KeepAliveService extends Service {
     }
 
     /**
-     * 创建或刷新保护标记。
-     * 守护脚本优先读文件内容里的毫秒时间戳，mtime 只作为旧版本的回退信号；
-     * 标记只由 app 写，模块只读不删，这样不会出现"模块删了标记、app 没重建导致永久不保护"。
-     * 写内容而不是只 touch：setLastModified 只有秒级精度，同一秒内重复刷新等于没刷新。
+     * 创建或刷新保护标记。内容是 `<毫秒戳> <0|1>`：
+     * 第一段是新鲜度信号（模块按它判标记是否陈旧），第二段是「监听器当前是否绑定」。
+     *
+     * 为什么把绑定位塞进这个文件而不是单开一个 listener_bound：
+     * 单独一个"只在事件里删改"的文件，进程被 SIGKILL 时不会删，模块会拿残留标记
+     * 一直认为"已绑定"，从而永久跳过 dumpsys 复查与自愈（本机已实测复现）。
+     * 这里的标记每 60 秒由保活 tick 重写一次，进程一死时间戳立刻变旧，
+     * 模块按陈旧度自然失效，不需要任何"删除"动作。
+     *
+     * 第二段留空（旧版 app）时模块回落 dumpsys，保持向后兼容。
      */
     private void touchActiveFlag() {
         try {
             File flag = activeFlagFile();
+            String content = System.currentTimeMillis()
+                    + " " + (NotificationReaderService.isListenerBound() ? "1" : "0");
             try (FileOutputStream out = new FileOutputStream(flag, false)) {
-                out.write(Long.toString(System.currentTimeMillis())
-                        .getBytes(StandardCharsets.UTF_8));
+                out.write(content.getBytes(StandardCharsets.UTF_8));
             }
             flag.setLastModified(System.currentTimeMillis());
         } catch (IOException ignored) {
